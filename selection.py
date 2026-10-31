@@ -122,7 +122,9 @@ MAX_PUSH_PER_DAY = int(os.getenv("SELECTION_MAX_PUSH_PER_DAY", "6"))
 # 影子模式：只记录、不推送。上线头一两周建议开着 —— 先攒样本再调阈值，
 # 别拿第一批付费用户当小白鼠。
 SHADOW_MODE = os.getenv("SELECTION_SHADOW", "0").strip().lower() in ("1", "true", "yes")
-SEEN_TTL = 6 * 3600           # 同一个币 6 小时内不重复推
+# 同一个币多久内不重复评估。推送期该长（避免重复骚扰），影子期该短（要样本）。
+# 所以做成可配：测试期设 2，正式期改回 6。
+SEEN_TTL = int(os.getenv("SELECTION_SEEN_TTL_H", "6")) * 3600
 # 影子记录落盘路径：没配 Redis 时用它，单机测试期比外部服务更可靠
 SHADOW_FILE = os.getenv("SELECTION_SHADOW_FILE", "/opt/chain-dog/shadow.jsonl")
 
@@ -733,32 +735,51 @@ def at_least(c, grade="A"):
 def grade_cap(ctx, cand):
     """评级上限：分数是排序，等级是承诺强度。
 
-    筹码过度集中、已垂直拉升的币，其它维度再漂亮也不能给 S/A ——
-    这类币恰恰最容易在推出去之后砸盘。宁可少推，不可推错。
+    把所有触发条件都算一遍，取最严的一条 —— 不用 early-return。
+    早期版本命中第一条就 return，于是"24h 涨 197% → A"会先返回，
+    把后面"池子只有 $31K → B"整条规则盖掉：一个更严重的缺陷被一个较轻的掩盖了。
     """
+    bad, warn = [], []
+
+    def lim(bucket, why):
+        bucket.append(why)
+
     if ctx.get("eoa_pct", 0) > 50:
-        return "B"
+        lim(bad, "个人持仓>50%")
     if (cand.get("pc1h") or 0) > 150:
-        return "B"
-    # 24h 涨幅封顶：一天翻 3 倍以上不承诺等级；翻 1.5 倍以上不给 S
-    if (cand.get("pc24h") or 0) > 300:
-        return "B"
-    if (cand.get("pc24h") or 0) > 150:
-        return "A"
-    # 下跌趋势与假成交量同样不给承诺
-    if (cand.get("pc24h") or 0) < -40:
-        return "B"
-    if (cand.get("pc24h") or 0) < -10:
-        return "A"
-    _turn = (cand.get("vol24") or 0) / max(cand.get("liq") or 0, 1.0)
-    if _turn > 30:
-        return "B"
-    if _turn > 20:
-        return "A"
+        lim(bad, "1h 涨超 150%")
+
+    # 池子太薄：几万美元就能把盘砸穿，这种深度不配"推荐"两个字
+    liq = cand.get("liq") or 0
+    if liq < 50000:
+        lim(bad, f"池子 ${liq/1000:.0f}K")
+    elif liq < 100000:
+        lim(warn, f"池子 ${liq/1000:.0f}K")
+
+    # 看不见筹码 = 判断不了砸盘风险。分数可以高，但等级不能是强承诺
+    if "持仓" in (ctx.get("unknowns") or []):
+        lim(bad, "筹码数据缺失")
+
+    pc24 = cand.get("pc24h") or 0
+    if pc24 > 300 or pc24 < -20:
+        lim(bad, f"24h {pc24:+.0f}%")
+    elif pc24 > 150 or pc24 < -10:
+        lim(warn, f"24h {pc24:+.0f}%")
+
+    turn = (cand.get("vol24") or 0) / max(liq or 1.0, 1.0)
+    if turn > 30:
+        lim(bad, f"换手 {turn:.0f}x")
+    elif turn > 20:
+        lim(warn, f"换手 {turn:.0f}x")
+
     if ctx.get("top10", 0) > 0 and ctx.get("lp_lock") is None \
             and not ctx.get("burned") and ctx.get("eoa_pct", 0) > 40:
-        return "B"
-    return "S"
+        lim(bad, "LP 未锁且筹码集中")
+
+    # 把触发原因记在 ctx 上：用户看到"89 分却是 B"必须能当场知道为什么，
+    # 否则只会觉得评分乱来。这也是客服解释"为什么这个币没进推送"的依据。
+    ctx["cap"] = bad or warn
+    return "B" if bad else ("A" if warn else "S")
 
 
 def capped_grade(total, ctx, cand):
@@ -836,6 +857,9 @@ def render_pick(c, idx=None, detail=True):
         ws = c["ctx"].get("warns") or []
         if ws:
             lines.append(f"⚠️ 留意　{' / '.join(ws[:3])}")
+        cap = c["ctx"].get("cap") or []
+        if cap:
+            lines.append(f"⛔ 上限　{' / '.join(cap[:2])}")
         lines.append(f"🛑 失效　{'｜'.join(c['invalidations'][:2])}")
         lines.append(f"🔗 {c.get('pair_url', '')}")
     return "\n".join(lines)
@@ -1099,8 +1123,13 @@ def scan_once(networks=None, limit=12, enrich=True):
     pre.sort(key=lambda c: -((c.get("vol24") or 0) / max(c.get("liq") or 1, 1)))
     # 先排序再截断，最后才打"已看过"标记 —— 否则被截掉的那批会被误标已推，
     # 6 小时内再也进不了候选（等于白丢）。
-    pre = [c for c in pre[:limit * 4]
+    head = pre[:limit * 4]
+    pre = [c for c in head
            if not _seen_before(f"{c['network']}:{c['addr'].lower()}")]
+    if len(head) > len(pre):
+        # 去重掉的数量必须显式记下来，否则 scanned 和 rejects 永远对不上账，
+        # 看起来像"数据丢了"，其实是被 6 小时去重挡掉了。
+        rejects["已看过(6小时内)"] = len(head) - len(pre)
 
     ex = _executor("QUERY_EXECUTOR", 8)
     if enrich:
