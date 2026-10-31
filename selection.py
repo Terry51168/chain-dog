@@ -888,7 +888,11 @@ def render_digest(picks, title=None, free=False, scanned=0, when=None, delayed=F
         # 兜底时给的是实时榜单，文案必须跟着改，否则就是虚假宣传 —— 用户一旦发现，
         # "付费才能拿到最新"这个卖点当场失效。
         tag = "且延迟 2 小时" if delayed else ""
-        lines.append(f"🔒 免费版仅显示 {FREE_MAX_PICKS} 个{tag}，不含失效条件与建仓逻辑。")
+        # 只筛出 2 个时说"仅显示 3 个"，用户会以为被吞了一个 —— 明明是自己筛得严。
+        if len(shown) < FREE_MAX_PICKS:
+            lines.append(f"🔒 本期免费可见 {len(shown)} 个{tag}，不含失效条件与建仓逻辑。")
+        else:
+            lines.append(f"🔒 免费版仅显示 {FREE_MAX_PICKS} 个{tag}，不含失效条件与建仓逻辑。")
         lines.append("👉 发送 /订阅 查看完整榜单（实时推送 + 失效提醒 + 战绩回溯）")
     else:
         lines.append("📌 以上为数据筛选结果，非投资建议；仓位自控，严格按失效条件离场。")
@@ -1038,12 +1042,21 @@ _PUSH_COUNT = {"date": "", "n": 0}
 _FREE_LAST = 0.0
 
 
-def _seen_before(addr):
+def _seen_before(addr, write=True):
+    """最近扫过没有。write=False 时只读不写 —— 这一条是必须的。
+
+    手动 /金狗 如果也写标记，用户每查一次就把当场那批币锁死一整个 SEEN_TTL，
+    随后的定时任务全部撞"已看过"，推送直接归零。表现出来就是：
+    刚 /金狗 推出 2 个，过一会儿 /甄选记录 却显示"本期 0 个"。
+    查得越勤，自动推送越哑火 —— 这是最反直觉、也最难自己看出来的一种 bug。
+    """
     now = time.time()
     with _SEEN_LOCK:
         ts = _SEEN.get(addr)
         if ts and now - ts < SEEN_TTL:
             return True
+        if not write:
+            return False
         _SEEN[addr] = now
         if len(_SEEN) > 5000:
             for k, v in list(_SEEN.items()):
@@ -1094,7 +1107,7 @@ def evaluate(cand):
 _LAST_DIAG = {}
 
 
-def scan_once(networks=None, limit=12, enrich=True):
+def scan_once(networks=None, limit=12, enrich=True, mark=True):
     """扫一轮，返回按分数降序的合格标的。耗时约 5~15 秒（并发）。
 
     同时把"每个候选卡在哪一层"记进 _LAST_DIAG。甄选最容易出的问题不是打分不准，
@@ -1125,11 +1138,12 @@ def scan_once(networks=None, limit=12, enrich=True):
     # 6 小时内再也进不了候选（等于白丢）。
     head = pre[:limit * 4]
     pre = [c for c in head
-           if not _seen_before(f"{c['network']}:{c['addr'].lower()}")]
+           if not _seen_before(f"{c['network']}:{c['addr'].lower()}", write=mark)]
     if len(head) > len(pre):
         # 去重掉的数量必须显式记下来，否则 scanned 和 rejects 永远对不上账，
-        # 看起来像"数据丢了"，其实是被 6 小时去重挡掉了。
-        rejects["已看过(6小时内)"] = len(head) - len(pre)
+        # 看起来像"数据丢了"，其实是被去重挡掉了。小时数从常量取，
+        # 不要写死成 6 —— 调到 2 小时之后文案还写 6，排查时会跟着走错路。
+        rejects[f"已看过({SEEN_TTL // 3600}小时内)"] = len(head) - len(pre)
 
     ex = _executor("QUERY_EXECUTOR", 8)
     if enrich:
@@ -1173,11 +1187,12 @@ def _cooldown_ok(uid, sec=60):
         return True
 
 
-def ensure_picks(limit=8):
+def ensure_picks(limit=8, mark=True):
     """取本期榜单，没有就现扫一次。
 
     返回 (picks, scanned, 是否真的扫过)。加锁 + 30 秒节流：
     群里 20 个人同时发 /金狗，不能触发 20 次全链扫描把额度打光。
+    mark=False 用于手动查询：不写去重标记，免得把手动查的那批币锁死。
     """
     global _LAST_SCAN_TS
     if _LAST_PICKS:
@@ -1187,7 +1202,7 @@ def ensure_picks(limit=8):
     try:
         if _LAST_PICKS:
             return _LAST_PICKS, 0, True
-        picks, scanned = scan_once(limit=limit)
+        picks, scanned = scan_once(limit=limit, mark=mark)
         _LAST_SCAN_TS = time.time()
         return picks, scanned, True
     finally:
@@ -1228,7 +1243,7 @@ def _send_group(gid, text):
 
 
 # ---------- 影子记录：只写库，不推送 ----------
-def _shadow_record(picks, scanned=0):
+def _shadow_record(picks, scanned=0, manual=False):
     """把本期结果写进 Redis（base64 过的 JSON），供事后复盘。
 
     为什么不用明文 JSON 拼路径：Upstash REST 的命令参数在 URL path 里，
@@ -1247,6 +1262,11 @@ def _shadow_record(picks, scanned=0):
         rows.append({"ts": int(time.time()), "empty": True, "scanned": scanned,
                      "pre": _LAST_DIAG.get("pre"), "rejects": _LAST_DIAG.get("rejects"),
                      "weak": _LAST_DIAG.get("weak")})
+    if manual:
+        # 手动 /金狗 也留档：不然"我明明推了 2 个，记录却是 0"这种对不上账的情况
+        # 会一直出现。但标记来源，统计时和定时任务分开算，别把手动查询算成"期"。
+        for r in rows:
+            r["manual"] = 1
     if _redis_ready():
         for payload in rows:
             raw = base64.urlsafe_b64encode(
@@ -1310,26 +1330,32 @@ def render_shadow(days=3, recent=12):
                 "还没有数据。\n"
                 "定时任务每 30 分钟记一次；也可以发一次 /金狗 立刻产生一条。")
 
-    picks, empties, periods = [], [], {}
+    picks, empties = [], []
+    auto, man = {}, {}
     for r in rows:
         ts = r.get("ts", 0)
-        periods.setdefault(ts, 0)
+        book = man if r.get("manual") else auto
+        book.setdefault(ts, 0)
         if r.get("empty"):
             empties.append(r)
         else:
-            periods[ts] += 1
+            book[ts] += 1
             picks.append(r)
-    seq = [periods[k] for k in sorted(periods)]          # 旧 → 新
-    zero = sum(1 for n in seq if n == 0)
+    auto_seq = [auto[k] for k in sorted(auto)]          # 旧 → 新
+    man_seq = [man[k] for k in sorted(man)]
+    zero = sum(1 for n in auto_seq if n == 0)
     by_grade = {g: sum(1 for r in picks if r.get("grade") == g) for g in ("S", "A", "B")}
 
+    # 自动和手动必须分开算："我刚推了 2 个"和"这 2 个小时的定时任务没出货"
+    # 是两件事，混在一起数就永远对不上，也看不出定时任务到底有没有在干活。
     lines = [f"📊 甄选影子记录 · 近 {days} 天",
-             f"扫描 {len(seq)} 期，入选 {len(picks)} 个",
-             f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"
-             f"　零入选 {zero} 期"]
-    lines.append("▱▱▱▱▱▱▱▱▱▱")
-    lines.append(f"每期入选数（最近 {min(recent, len(seq))} 期，旧→新）")
-    lines.append(" ".join(str(n) for n in seq[-recent:]))
+             f"自动扫描 {len(auto_seq)} 期：入选 {sum(auto_seq)} 个，零入选 {zero} 期",
+             f"手动查询 {len(man_seq)} 次：入选 {sum(man_seq)} 个",
+             f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"]
+    if auto_seq:
+        lines.append("▱▱▱▱▱▱▱▱▱▱")
+        lines.append(f"每期入选数（最近 {min(recent, len(auto_seq))} 期，旧→新）")
+        lines.append(" ".join(str(n) for n in auto_seq[-recent:]))
     if picks:
         lines.append("▱▱▱▱▱▱▱▱▱▱")
         lines.append("最近入选")
@@ -1580,7 +1606,7 @@ def handle_selection_command(data, message=None):
         if not member and not _cooldown_ok(uid, 60):
             _reply(data, "🐕 慢一点，60 秒后才能再查一次。订阅后不限频 → /订阅")
             return True
-        picks, scanned, did_scan = ensure_picks(limit=8)
+        picks, scanned, did_scan = ensure_picks(limit=8, mark=False)
         if not did_scan:
             # 另一个请求正在扫，或刚扫过还没出结果：让对方等 10 秒，别触发第二次全链扫描
             _reply(data, "🐕 正在扫描全链，约 10 秒后重发 /金狗 即可")
@@ -1589,6 +1615,9 @@ def handle_selection_command(data, message=None):
             # 一个池子都没拉到 = 数据源挂了，不能谎报"本期无标的"
             _reply(data, "🐕 行情源暂时不可用，稍后再试（不影响安全查询）")
             return True
+        if scanned > 0:
+            # 真扫了一轮才留档；scanned=0 是命中内存缓存，记了只会把同一期重复算几遍
+            _shadow_record(picks, scanned, manual=True)
         if member:
             _reply(data, render_digest(picks[:8], scanned=scanned))
         else:
