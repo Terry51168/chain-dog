@@ -1330,7 +1330,7 @@ def render_shadow(days=3, recent=12):
                 "还没有数据。\n"
                 "定时任务每 30 分钟记一次；也可以发一次 /金狗 立刻产生一条。")
 
-    picks, empties = [], []
+    picks, empties, man_picks = [], [], []
     auto, man = {}, {}
     for r in rows:
         ts = r.get("ts", 0)
@@ -1341,16 +1341,22 @@ def render_shadow(days=3, recent=12):
         else:
             book[ts] += 1
             picks.append(r)
+            if r.get("manual"):
+                man_picks.append(r)
     auto_seq = [auto[k] for k in sorted(auto)]          # 旧 → 新
     man_seq = [man[k] for k in sorted(man)]
     zero = sum(1 for n in auto_seq if n == 0)
+    man_strong = sum(1 for r in man_picks if r.get("grade") in ("S", "A"))
     by_grade = {g: sum(1 for r in picks if r.get("grade") == g) for g in ("S", "A", "B")}
 
     # 自动和手动必须分开算："我刚推了 2 个"和"这 2 个小时的定时任务没出货"
     # 是两件事，混在一起数就永远对不上，也看不出定时任务到底有没有在干活。
+    # 手动那行还要报 A 级以上几个：免费版只给 A 级以上，群里看到 2 个而这里写 8 个，
+    # 差出来的 6 个全是 B 级 —— 不点明，用户只会以为记录在瞎报。
     lines = [f"📊 甄选影子记录 · 近 {days} 天",
              f"自动扫描 {len(auto_seq)} 期：入选 {sum(auto_seq)} 个，零入选 {zero} 期",
-             f"手动查询 {len(man_seq)} 次：入选 {sum(man_seq)} 个",
+             f"手动查询 {len(man_seq)} 次：入选 {len(man_picks)} 个"
+             f"（A 级以上 {man_strong}）",
              f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"]
     if auto_seq:
         lines.append("▱▱▱▱▱▱▱▱▱▱")
@@ -1359,7 +1365,10 @@ def render_shadow(days=3, recent=12):
     if picks:
         lines.append("▱▱▱▱▱▱▱▱▱▱")
         lines.append("最近入选")
-        for r in sorted(picks, key=lambda x: -x.get("ts", 0))[:5]:
+        # 同一轮的币 ts 完全相同，只按时间排会按写入顺序出，77 分的 B 可能压在
+        # 77 分的 A 上面。同轮再按分数、再按等级排，否则看起来像等级判错了。
+        for r in sorted(picks, key=lambda x: (-x.get("ts", 0), -x.get("score", 0),
+                                              -GRADE_RANK.get(x.get("grade", "C"), 0)))[:5]:
             t = datetime.fromtimestamp(r.get("ts", 0), tz=timezone(timedelta(hours=8)))
             lines.append(f"{GRADE_ICON.get(r.get('grade'), '·')} {r.get('grade')} "
                          f"{r.get('score')}分 ${r.get('symbol')} "
@@ -1630,7 +1639,10 @@ def handle_selection_command(data, message=None):
         return True
 
     if low.split(" ")[0] in ("/甄选战绩", "/战绩", "/track"):
-        _reply(data, render_track())
+        # 支持 /战绩 30 看一个月；默认 7 天。战绩是给用户看的，不做管理员限制。
+        parts = cmd.split()
+        days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+        _reply(data, render_track(max(1, min(30, days))))
         return True
 
     if low.split(" ")[0] in ("/甄选记录", "/影子", "/shadow"):
@@ -1646,39 +1658,133 @@ def handle_selection_command(data, message=None):
     return False
 
 
+# ---------- 战绩回溯：入选价 → 现价 ----------
+_TRACK_CACHE = {}          # addr -> (ts, price)
+_TRACK_TTL = 300
+
+
+def _now_price(addr):
+    """当前价。三种结果必须分开：真实价格 / 已下架(0.0) / 取价失败(None)。
+
+    下架不能和网络抖动混为一谈：下架的币按 -100% 计，网络失败要跳过。
+    两者都当"查不到"悄悄跳过，胜率会凭空变好看 —— 这正是战绩最不该犯的错。
+    """
+    now = time.time()
+    hit = _TRACK_CACHE.get(addr)
+    if hit and now - hit[0] < _TRACK_TTL:
+        return hit[1], "ok"
+    try:
+        r = _session().get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+                           timeout=4)
+        if not r.ok:
+            return None, "net"
+        pairs = (r.json().get("pairs") or [])
+        cur = max((_to_float(p.get("priceUsd")) for p in pairs), default=0.0)
+        if cur <= 0:
+            return 0.0, "gone"
+        _TRACK_CACHE[addr] = (now, cur)
+        if len(_TRACK_CACHE) > 2000:
+            _TRACK_CACHE.clear()
+        return cur, "ok"
+    except Exception:
+        return None, "net"
+
+
+def _track_items(days):
+    """近 N 天记录过的标的：[(日期, 地址, 代号, 入选价, 等级), ...]
+
+    同一个币只算第一次：战绩的分子分母都是"一次推荐"，重复计入同一笔会虚增样本
+    数，也会让同一个币的涨跌被算好几遍。
+    有 Redis 用推送时写的 entry 集合（只含真正推出去的）；没 Redis 用影子文件
+    —— 影子期不推送，所以"入选"即视为推荐。
+    """
+    items, seen = [], set()
+    if _redis_ready():
+        for i in range(days):
+            d = (_now_bj() - timedelta(days=i)).strftime("%Y%m%d")
+            for a in (_upstash(f"smembers/xx:picks:{d}", "GET") or [])[:20]:
+                a = (a or "").lower()
+                entry = _to_float(_upstash(f"get/xx:entry:{a}", "GET") or 0)
+                if entry > 0 and a not in seen:
+                    seen.add(a)
+                    items.append((d, a, a[:6], entry, ""))
+        return items
+
+    rows = sorted(load_shadow(days), key=lambda x: x.get("ts", 0))   # 旧 → 新
+    for r in rows:
+        a = (r.get("addr") or "").lower()
+        p = _to_float(r.get("price") or 0)
+        if not a or p <= 0 or a in seen:
+            continue
+        seen.add(a)
+        t = datetime.fromtimestamp(r.get("ts", 0), tz=timezone(timedelta(hours=8)))
+        items.append((t.strftime("%Y%m%d"), a, r.get("symbol") or a[:6],
+                      p, r.get("grade") or ""))
+    return items
+
+
 def render_track(days=7):
-    """战绩回溯：把过去 N 天推过的币按当前价对一遍，赚亏都列。"""
-    rows, wins, total = [], 0, 0
-    for i in range(days):
-        d = (_now_bj() - timedelta(days=i)).strftime("%Y%m%d")
-        addrs = _upstash(f"smembers/xx:picks:{d}", "GET") or []
-        for a in addrs[:20]:
-            entry = _to_float(_upstash(f"get/xx:entry:{a}", "GET") or 0)
-            if entry <= 0:
-                continue
-            cur = 0.0
-            try:
-                r = _session().get(f"https://api.dexscreener.com/latest/dex/tokens/{a}", timeout=4)
-                pairs = (r.json().get("pairs") or []) if r.ok else []
-                cur = max((_to_float(p.get("priceUsd")) for p in pairs), default=0)
-            except Exception:
-                cur = 0
-            if cur <= 0:
-                continue
-            roi = (cur - entry) / entry * 100
-            total += 1
-            wins += 1 if roi > 0 else 0
-            rows.append((d, a[:6], roi))
+    """战绩回溯：把过去 N 天推过的币按当前价对一遍，赚的亏的都列。
+
+    这是唯一能回答"模型到底准不准"的东西。只报胜率不够：中位数才说明大部分标的
+    是否真赚钱，平均数会被一两个十倍币拉飞。等级分组则是验证"S 比 B 强"的唯一证据
+    —— 如果 S 和 B 的表现没差别，那分级就是摆设，卖点也就没了。
+    """
+    items = _track_items(days)
+    if not items:
+        return (f"📊 甄选战绩 · 近 {days} 天\n"
+                "还没有记录。\n"
+                "先发一次 /金狗 产生一条，过几小时再回来对价。")
+
+    addrs = [it[1] for it in items]
+    try:
+        prices = list(_executor("TRACK_EXECUTOR", 6).map(_now_price, addrs))
+    except Exception:
+        prices = [_now_price(a) for a in addrs]
+
+    rows, skipped = [], 0
+    for (d, a, sym, entry, grade), (cur, st) in zip(items, prices):
+        if st == "net" or cur is None:
+            skipped += 1
+            continue
+        rows.append({"d": d, "sym": sym, "grade": grade,
+                     "roi": (cur - entry) / entry * 100, "gone": st == "gone"})
     if not rows:
-        return "📊 暂无战绩数据（需要至少推送过一期，并在推送时记录入选价）"
-    rows.sort(key=lambda r: -r[2])
-    lines = [f"📊 甄选战绩 · 近 {days} 天（{total} 个标的）",
-             f"胜率 {wins/total*100:.0f}%　"
-             f"中位收益 {sorted(r[2] for r in rows)[total//2]:+.0f}%", "▱▱▱▱▱▱▱▱▱▱"]
-    for d, a, roi in rows[:10]:
-        lines.append(f"{'🟢' if roi > 0 else '🔴'} {a}… {roi:+.0f}%　{d[4:6]}/{d[6:]}")
+        return "📊 战绩取价失败（行情源没响应），过几分钟再试。"
+
+    rows.sort(key=lambda r: -r["roi"])
+    n = len(rows)
+    win = sum(1 for r in rows if r["roi"] > 0)
+    roi_sorted = sorted(r["roi"] for r in rows)
+    med = roi_sorted[n // 2]
+    avg = sum(roi_sorted) / n
+
+    lines = [f"📊 甄选战绩 · 近 {days} 天（{n} 个标的）",
+             f"胜率 {win / n * 100:.0f}%　中位 {med:+.0f}%　平均 {avg:+.0f}%",
+             f"最好 ${rows[0]['sym']} {rows[0]['roi']:+.0f}%　"
+             f"最差 ${rows[-1]['sym']} {rows[-1]['roi']:+.0f}%"]
+
+    graded = [(g, [r for r in rows if r["grade"] == g]) for g in ("S", "A", "B")]
+    if any(grp for _, grp in graded):
+        lines.append("▱▱▱▱▱▱▱▱▱▱")
+        for g, grp in graded:
+            if not grp:
+                continue
+            gavg = sum(r["roi"] for r in grp) / len(grp)
+            gwin = sum(1 for r in grp if r["roi"] > 0) / len(grp) * 100
+            lines.append(f"{GRADE_ICON.get(g, '·')} {g} {len(grp)} 个："
+                         f"平均 {gavg:+.0f}%　胜率 {gwin:.0f}%")
+
     lines.append("▱▱▱▱▱▱▱▱▱▱")
-    lines.append("含亏损标的，按推送价计算，未计滑点与税费。")
+    for r in rows[:10]:
+        icon = (GRADE_ICON.get(r["grade"], "·") + " ") if r["grade"] else ""
+        tag = "　已下架" if r["gone"] else ""
+        lines.append(f"{'🟢' if r['roi'] > 0 else '🔴'} {icon}"
+                     f"${r['sym']} {r['roi']:+.0f}%{tag}　"
+                     f"{r['d'][4:6]}/{r['d'][6:]}")
+    if skipped:
+        lines.append(f"（另有 {skipped} 个取价失败，未计入）")
+    lines.append("按入选价对现价，未计滑点与税费；下架按 -100% 计。")
     return "\n".join(lines)
 
 
