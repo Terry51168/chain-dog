@@ -123,6 +123,9 @@ MAX_PUSH_PER_DAY = int(os.getenv("SELECTION_MAX_PUSH_PER_DAY", "6"))
 # 别拿第一批付费用户当小白鼠。
 SHADOW_MODE = os.getenv("SELECTION_SHADOW", "0").strip().lower() in ("1", "true", "yes")
 SEEN_TTL = 6 * 3600           # 同一个币 6 小时内不重复推
+# 影子记录落盘路径：没配 Redis 时用它，单机测试期比外部服务更可靠
+SHADOW_FILE = os.getenv("SELECTION_SHADOW_FILE", "/opt/chain-dog/shadow.jsonl")
+
 FREE_DELAY_SEC = 2 * 3600     # 免费群延迟 2 小时、只给 3 个 B 级以上
 FREE_MAX_PICKS = 3
 
@@ -592,6 +595,14 @@ def score(cand, info):
     else:
         mom = 6
         warns.append("换手异常（疑似刷量）")
+    # 换手 20 倍以上基本只有一种解释：机器人对倒刷量。
+    # 这种池子的成交量是假的，用它判断"有人接盘"会得出完全相反的结论。
+    if turnover > 30:
+        mom = max(0, mom - 6)
+        warns.append(f"换手 {turnover:.0f}x，疑似机器人对倒")
+    elif turnover > 20:
+        mom = max(0, mom - 3)
+        warns.append(f"换手 {turnover:.0f}x，成交异常")
 
     buys, sells = cand.get("buys24") or 0, cand.get("sells24") or 0
     ratio = buys / max(sells, 1)
@@ -643,6 +654,14 @@ def score(cand, info):
     elif pc24h > 300:
         mom -= 3
         warns.append(f"24h +{pc24h:.0f}%，短线过热")
+
+    # 跌也要扣：24 小时阴跌说明进场资金已经在撤，这时候推出去是让人接货
+    if pc24h < -50:
+        mom -= 6
+        warns.append(f"24h {pc24h:.0f}%，下跌趋势")
+    elif pc24h < -25:
+        mom -= 3
+        warns.append(f"24h {pc24h:.0f}%，已走弱")
     momentum = max(0, min(W_MOMENTUM, mom))
 
     # ---------- 4. 新鲜度 10 ----------
@@ -725,6 +744,16 @@ def grade_cap(ctx, cand):
     if (cand.get("pc24h") or 0) > 300:
         return "B"
     if (cand.get("pc24h") or 0) > 150:
+        return "A"
+    # 下跌趋势与假成交量同样不给承诺
+    if (cand.get("pc24h") or 0) < -40:
+        return "B"
+    if (cand.get("pc24h") or 0) < -10:
+        return "A"
+    _turn = (cand.get("vol24") or 0) / max(cand.get("liq") or 0, 1.0)
+    if _turn > 30:
+        return "B"
+    if _turn > 20:
         return "A"
     if ctx.get("top10", 0) > 0 and ctx.get("lp_lock") is None \
             and not ctx.get("burned") and ctx.get("eoa_pct", 0) > 40:
@@ -812,7 +841,7 @@ def render_pick(c, idx=None, detail=True):
     return "\n".join(lines)
 
 
-def render_digest(picks, title=None, free=False, scanned=0, when=None):
+def render_digest(picks, title=None, free=False, scanned=0, when=None, delayed=False):
     """一期榜单。免费版只给 3 个且不带理由 —— 让人看见、但看不全。"""
     when = when or _now_bj()
     title = title or f"🏆 链上甄选 · {when.strftime('%m/%d %H:%M')}"
@@ -831,7 +860,11 @@ def render_digest(picks, title=None, free=False, scanned=0, when=None):
             lines.append("")
     lines.append("▱▱▱▱▱▱▱▱▱▱")
     if free:
-        lines.append(f"🔒 免费版仅显示 {FREE_MAX_PICKS} 个且延迟 2 小时，不含建仓逻辑与失效条件。")
+        # 只有真的用了延迟数据才敢说"延迟 2 小时"。
+        # 兜底时给的是实时榜单，文案必须跟着改，否则就是虚假宣传 —— 用户一旦发现，
+        # "付费才能拿到最新"这个卖点当场失效。
+        tag = "且延迟 2 小时" if delayed else ""
+        lines.append(f"🔒 免费版仅显示 {FREE_MAX_PICKS} 个{tag}，不含失效条件与建仓逻辑。")
         lines.append("👉 发送 /订阅 查看完整榜单（实时推送 + 失效提醒 + 战绩回溯）")
     else:
         lines.append("📌 以上为数据筛选结果，非投资建议；仓位自控，严格按失效条件离场。")
@@ -856,6 +889,18 @@ def _upstash(path, method="POST"):
     except Exception as e:
         print(f"[pick] upstash 异常 {path[:40]}: {e}")
         return None
+
+
+def _redis_ready():
+    """Redis 是否配置好。没配的话影子记录、去重、会员校验全部静默失效，
+    但服务本身照跑 —— 这种"半残"状态必须能被一眼看见，所以放进 ping。"""
+    if BOT is None:
+        url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    else:
+        url = os.getenv("UPSTASH_REDIS_REST_URL", "") or getattr(BOT, "UPSTASH_URL", "")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "") or getattr(BOT, "UPSTASH_TOKEN", "")
+    return bool(url and token)
 
 
 def _b32(b):
@@ -1022,15 +1067,35 @@ def evaluate(cand):
     return cand
 
 
+_LAST_DIAG = {}
+
+
 def scan_once(networks=None, limit=12, enrich=True):
-    """扫一轮，返回按分数降序的合格标的。耗时约 5~15 秒（并发）。"""
+    """扫一轮，返回按分数降序的合格标的。耗时约 5~15 秒（并发）。
+
+    同时把"每个候选卡在哪一层"记进 _LAST_DIAG。甄选最容易出的问题不是打分不准，
+    而是某个门槛把所有标的筛光了，外部却只看得到"本期 0 个"。没有这层统计，
+    调阈值就是盲改，改完也不知道是变好了还是变差了。
+    """
+    global _LAST_DIAG
     raw = _candidates(networks)
     scanned = len(raw)
+    rejects = {}
+
+    def _drop(reason):
+        rejects[reason] = rejects.get(reason, 0) + 1
+
     # 先做便宜的门槛（流动性/池龄/交易数），把 80% 垃圾挡在 GoPlus 之前，省配额
-    pre = [c for c in raw
-           if (c.get("liq") or 0) >= GATE_MIN_LIQ_USD
-           and (c.get("age_min") is None or c["age_min"] >= GATE_MIN_AGE_MIN)
-           and (c.get("buys24", 0) + c.get("sells24", 0)) >= GATE_MIN_TXNS_24H]
+    pre = []
+    for c in raw:
+        if (c.get("liq") or 0) < GATE_MIN_LIQ_USD:
+            _drop("池子过小")
+        elif c.get("age_min") is not None and c["age_min"] < GATE_MIN_AGE_MIN:
+            _drop("池龄过短")
+        elif (c.get("buys24", 0) + c.get("sells24", 0)) < GATE_MIN_TXNS_24H:
+            _drop("交易过少")
+        else:
+            pre.append(c)
     pre.sort(key=lambda c: -((c.get("vol24") or 0) / max(c.get("liq") or 1, 1)))
     # 先排序再截断，最后才打"已看过"标记 —— 否则被截掉的那批会被误标已推，
     # 6 小时内再也进不了候选（等于白丢）。
@@ -1040,9 +1105,22 @@ def scan_once(networks=None, limit=12, enrich=True):
     ex = _executor("QUERY_EXECUTOR", 8)
     if enrich:
         list(ex.map(dexscreener_enrich, pre))
-    evaled = [c for c in ex.map(evaluate, pre) if c]
+    results = list(ex.map(evaluate, pre))
+    evaled, weak = [], []
+    for org, c in zip(pre, results):
+        if not c:
+            _drop((org or {}).get("rejected") or "未通过")
+            continue
+        evaled.append(c)
+        if c["score"] < SELECTION_MIN_SCORE:
+            weak.append({"symbol": c["symbol"], "score": c["score"], "grade": c["grade"]})
     evaled.sort(key=lambda c: -c["score"])
-    return [c for c in evaled if c["score"] >= SELECTION_MIN_SCORE][:limit], scanned
+    weak.sort(key=lambda x: -x["score"])
+    hits = [c for c in evaled if c["score"] >= SELECTION_MIN_SCORE][:limit]
+    _LAST_DIAG = {"ts": int(time.time()), "scanned": scanned, "pre": len(pre),
+                  "rejects": dict(sorted(rejects.items(), key=lambda kv: -kv[1])[:12]),
+                  "weak": weak[:5], "hits": len(hits)}
+    return hits, scanned
 
 
 _LAST_SCAN_TS = 0.0
@@ -1128,29 +1206,122 @@ def _shadow_record(picks, scanned=0):
     币名带 "/" 或 "?" 会把路径截断，base64 之后不会有任何特殊字符。
     """
     day = _now_bj().strftime("%Y%m%d")
+    rows = []
     for c in picks:
-        payload = {"ts": int(time.time()), "symbol": c["symbol"], "addr": c["addr"],
-                   "network": c["network"], "score": c["score"], "grade": c["grade"],
-                   "price": c.get("price"), "liq": c.get("liq"), "vol24": c.get("vol24"),
-                   "dims": c.get("dims"), "warns": (c.get("ctx") or {}).get("warns")}
-        raw = base64.urlsafe_b64encode(
-            json.dumps(payload, ensure_ascii=False).encode()).decode().rstrip("=")
-        _upstash(f"rpush/xx:shadow:{day}/{raw}")
-    _upstash(f"ltrim/xx:shadow:{day}/0/499", "GET")
-    _upstash(f"expire/xx:shadow:{day}/{86400 * 120}", "GET")
+        rows.append({"ts": int(time.time()), "symbol": c["symbol"], "addr": c["addr"],
+                     "network": c["network"], "score": c["score"], "grade": c["grade"],
+                     "price": c.get("price"), "liq": c.get("liq"), "vol24": c.get("vol24"),
+                     "dims": c.get("dims"), "warns": (c.get("ctx") or {}).get("warns")})
+    if not rows:
+        # 空结果同样要留档。连续几天 0 个，是门槛太严、还是数据源压根没给数据，
+        # 只有把"为什么 0 个"记下来才分得清；只记命中数，复盘就退化成猜。
+        rows.append({"ts": int(time.time()), "empty": True, "scanned": scanned,
+                     "pre": _LAST_DIAG.get("pre"), "rejects": _LAST_DIAG.get("rejects"),
+                     "weak": _LAST_DIAG.get("weak")})
+    if _redis_ready():
+        for payload in rows:
+            raw = base64.urlsafe_b64encode(
+                json.dumps(payload, ensure_ascii=False).encode()).decode().rstrip("=")
+            _upstash(f"rpush/xx:shadow:{day}/{raw}")
+        _upstash(f"ltrim/xx:shadow:{day}/0/499", "GET")
+        _upstash(f"expire/xx:shadow:{day}/{86400 * 120}", "GET")
+        return
+    # 没配 Redis：直接落盘。测试期只有一台机器，一个文件比外部服务更少出错，
+    # 也不用为了看记录先去注册数据库 —— 否则"先跑三天看看"就卡在配置上了。
+    try:
+        d = os.path.dirname(SHADOW_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(SHADOW_FILE, "a", encoding="utf-8") as f:
+            for payload in rows:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[pick] 影子落盘失败: {e}")
 
 
 def load_shadow(days=3):
     out = []
-    for i in range(days):
-        day = (_now_bj() - timedelta(days=i)).strftime("%Y%m%d")
-        for r in (_upstash(f"lrange/xx:shadow:{day}/0/-1", "GET") or []):
-            try:
-                out.append(json.loads(base64.urlsafe_b64decode(r + "=" * (-len(r) % 4)).decode()))
-            except Exception:
-                continue
+    if _redis_ready():
+        for i in range(days):
+            day = (_now_bj() - timedelta(days=i)).strftime("%Y%m%d")
+            for r in (_upstash(f"lrange/xx:shadow:{day}/0/-1", "GET") or []):
+                try:
+                    out.append(json.loads(base64.urlsafe_b64decode(
+                        r + "=" * (-len(r) % 4)).decode()))
+                except Exception:
+                    continue
+    else:
+        cutoff = time.time() - days * 86400
+        try:
+            with open(SHADOW_FILE, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("ts", 0) >= cutoff:
+                        out.append(row)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[pick] 影子读取失败: {e}")
     out.sort(key=lambda x: -x.get("ts", 0))
     return out
+
+
+def render_shadow(days=3, recent=12):
+    """把影子记录整理成人能读的几行。
+
+    原始 JSON 适合机器，不适合在手机上看 —— 而影子期唯一要回答的问题只有三个：
+    每期入了几个、等级分布对不对、被筛掉的主因是什么。所以只保留这三件事。
+    """
+    rows = load_shadow(days)
+    if not rows:
+        return (f"📊 甄选影子记录 · 近 {days} 天\n"
+                "还没有数据。\n"
+                "定时任务每 30 分钟记一次；也可以发一次 /金狗 立刻产生一条。")
+
+    picks, empties, periods = [], [], {}
+    for r in rows:
+        ts = r.get("ts", 0)
+        periods.setdefault(ts, 0)
+        if r.get("empty"):
+            empties.append(r)
+        else:
+            periods[ts] += 1
+            picks.append(r)
+    seq = [periods[k] for k in sorted(periods)]          # 旧 → 新
+    zero = sum(1 for n in seq if n == 0)
+    by_grade = {g: sum(1 for r in picks if r.get("grade") == g) for g in ("S", "A", "B")}
+
+    lines = [f"📊 甄选影子记录 · 近 {days} 天",
+             f"扫描 {len(seq)} 期，入选 {len(picks)} 个",
+             f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"
+             f"　零入选 {zero} 期"]
+    lines.append("▱▱▱▱▱▱▱▱▱▱")
+    lines.append(f"每期入选数（最近 {min(recent, len(seq))} 期，旧→新）")
+    lines.append(" ".join(str(n) for n in seq[-recent:]))
+    if picks:
+        lines.append("▱▱▱▱▱▱▱▱▱▱")
+        lines.append("最近入选")
+        for r in sorted(picks, key=lambda x: -x.get("ts", 0))[:5]:
+            t = datetime.fromtimestamp(r.get("ts", 0), tz=timezone(timedelta(hours=8)))
+            lines.append(f"{GRADE_ICON.get(r.get('grade'), '·')} {r.get('grade')} "
+                         f"{r.get('score')}分 ${r.get('symbol')} "
+                         f"{t.strftime('%m/%d %H:%M')}")
+    if empties:
+        last = max(empties, key=lambda x: x.get("ts", 0))
+        rej = last.get("rejects") or {}
+        if rej:
+            lines.append("▱▱▱▱▱▱▱▱▱▱")
+            lines.append("最近一次零入选的淘汰主因")
+            top = sorted(rej.items(), key=lambda kv: -kv[1])[:4]
+            lines.append("　".join(f"{k} {v}" for k, v in top))
+        weak = last.get("weak") or []
+        if weak:
+            lines.append("最接近门槛的：" + "、".join(
+                f"${w['symbol']} {w['score']}分" for w in weak[:3]))
+    return "\n".join(lines)
 
 
 # ---------- 单币诊断：回答"这个币为什么没上榜" ----------
@@ -1232,18 +1403,20 @@ def tick(force=False):
     picks, scanned = scan_once()
     prev_picks, prev_ts = _LAST_PICKS, _LAST_PICKS_TS
     _LAST_PICKS, _LAST_PICKS_TS = picks, time.time()
-    if not picks:
-        return 0
 
     if SHADOW_MODE:
-        # 影子期：全部记下来，一条不发。/金狗 仍可查，方便自己先看质量
+        # 影子期：全部记下来，一条不发。/金狗 仍可查，方便自己先看质量。
+        # 必须放在 "not picks" 之前 —— 否则空扫描不留痕，而空扫描恰恰是最该看的那种。
         _shadow_record(picks, scanned)
+        return 0
+
+    if not picks:
         return 0
 
     # 免费群：用上一期（冷却 2 小时）的榜单，晚 2 小时、只给 3 个、不给理由
     free = picks_for_free(prev_picks, prev_ts)
     if free and FREE_GROUPS and time.time() - _FREE_LAST >= FREE_DELAY_SEC:
-        txt = render_digest(free, free=True)
+        txt = render_digest(free, free=True, delayed=True)
         for gid in FREE_GROUPS:
             _send_group(gid, txt)
         _FREE_LAST = time.time()
@@ -1297,13 +1470,18 @@ def ensure_scheduler():
     return start_scheduler()
 
 
+_SCHED_THREAD = None
+
+
 def start_scheduler():
+    global _SCHED_THREAD
     serverless = ("VERCEL", "AWS_LAMBDA_FUNCTION_NAME", "FC_FUNCTION_NAME", "SCF_FUNCTIONNAME")
     if any(os.getenv(m) for m in serverless):
         print("[pick] Serverless 环境：跳过后台推送线程，请用 /cron/selection")
         return False
     t = threading.Thread(target=_loop, daemon=True, name="xx-scheduler")
     t.start()
+    _SCHED_THREAD = t
     return True
 
 
@@ -1396,6 +1574,17 @@ def handle_selection_command(data, message=None):
     if low.split(" ")[0] in ("/甄选战绩", "/战绩", "/track"):
         _reply(data, render_track())
         return True
+
+    if low.split(" ")[0] in ("/甄选记录", "/影子", "/shadow"):
+        # 管理员专用：影子期每天要看的就是这几行，比 curl 方便得多
+        admin = str(getattr(BOT, "ADMIN_USER_ID", "") if BOT else "")
+        if not admin or uid.lstrip("@") != admin.lstrip("@"):
+            _reply(data, "⚠️ 仅管理员可用")
+            return True
+        parts = cmd.split()
+        days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
+        _reply(data, render_shadow(max(1, min(30, days))))
+        return True
     return False
 
 
@@ -1474,7 +1663,9 @@ def selection_routes(app):
         """存活探针：不需要密钥，托管平台的 health check 直接打这里。"""
         return jsonify({"ok": True, "shadow": SHADOW_MODE,
                         "networks": DEFAULT_NETWORKS,
-                        "pushed_today": _PUSH_COUNT["n"]})
+                        "pushed_today": _PUSH_COUNT["n"],
+                        "redis": _redis_ready(),
+                        "sched": bool(_SCHED_THREAD and _SCHED_THREAD.is_alive())})
 
     @app.route("/selection/score", methods=["GET"])
     def _xx_score():
@@ -1492,11 +1683,27 @@ def selection_routes(app):
             days = max(1, min(30, int(request.args.get("days", 3))))
         except (TypeError, ValueError):
             days = 3
+        if request.args.get("format") == "text":
+            return app.response_class(render_shadow(days), mimetype="text/plain; charset=utf-8")
         rows = load_shadow(days)
         return jsonify({"count": len(rows),
                         "by_grade": {g: sum(1 for r in rows if r.get("grade") == g)
                                      for g in ("S", "A", "B")},
                         "rows": rows})
+
+    @app.route("/selection/diag", methods=["GET", "POST"])
+    def _xx_diag():
+        """"为什么 0 个"：回看最近一次扫描的淘汰分布。
+
+        带 scan=1 会现扫一轮（耗 15 秒），否则读上一次 /金狗 或定时任务的结果。
+        """
+        if not _auth():
+            return jsonify({"error": "unauthorized"}), 401
+        if request.args.get("scan") == "1" or not _LAST_DIAG:
+            scan_once(limit=8)
+        out = dict(_LAST_DIAG or {})
+        out["store"] = "redis" if _redis_ready() else "file:" + SHADOW_FILE
+        return jsonify(out)
 
     @app.route("/selection/codes", methods=["POST"])
     def _xx_codes():
