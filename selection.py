@@ -630,6 +630,19 @@ def score(cand, info):
     else:
         mom += 0
         warns.append(f"1h {pc1h:.0f}%，可能破位")
+
+    # 24h 涨幅单独扣分：只看 1h 会漏掉"横盘一天翻十倍"的币。
+    # 这类币的 1h 可能只涨 20%，但整体已经垂直，进场就是接最后一棒。
+    pc24h = cand.get("pc24h") or 0
+    if pc24h > 1000:
+        mom -= 9
+        warns.append(f"24h +{pc24h:.0f}%，垂直拉升")
+    elif pc24h > 500:
+        mom -= 6
+        warns.append(f"24h +{pc24h:.0f}%，涨幅过大")
+    elif pc24h > 300:
+        mom -= 3
+        warns.append(f"24h +{pc24h:.0f}%，短线过热")
     momentum = max(0, min(W_MOMENTUM, mom))
 
     # ---------- 4. 新鲜度 10 ----------
@@ -689,6 +702,15 @@ def grade_of(total):
 GRADE_RANK = {"C": 0, "B": 1, "A": 2, "S": 3}
 
 
+def at_least(c, grade="A"):
+    """按**等级**过滤，不是按分数。
+
+    等级上限（grade_cap）就是为了压住那些分数很高但结构有缺陷的币。
+    如果推送时又拿 score 筛，上限就白设了 —— 被压成 B 的币照样会被推出去。
+    """
+    return GRADE_RANK.get(c.get("grade", "C"), 0) >= GRADE_RANK[grade]
+
+
 def grade_cap(ctx, cand):
     """评级上限：分数是排序，等级是承诺强度。
 
@@ -699,6 +721,11 @@ def grade_cap(ctx, cand):
         return "B"
     if (cand.get("pc1h") or 0) > 150:
         return "B"
+    # 24h 涨幅封顶：一天翻 3 倍以上不承诺等级；翻 1.5 倍以上不给 S
+    if (cand.get("pc24h") or 0) > 300:
+        return "B"
+    if (cand.get("pc24h") or 0) > 150:
+        return "A"
     if ctx.get("top10", 0) > 0 and ctx.get("lp_lock") is None \
             and not ctx.get("burned") and ctx.get("eoa_pct", 0) > 40:
         return "B"
@@ -1070,7 +1097,7 @@ def picks_for_free(picks=None, ts=None):
     ts = _LAST_PICKS_TS if ts is None else ts
     if not picks or time.time() - ts < FREE_DELAY_SEC:
         return []
-    return [c for c in picks if c["score"] >= GRADE_A][:FREE_MAX_PICKS]
+    return [c for c in picks if at_least(c, "A")][:FREE_MAX_PICKS]
 
 
 def _send_raw(chat_type, chat_id, text):
@@ -1222,7 +1249,7 @@ def tick(force=False):
         _FREE_LAST = time.time()
 
     # 付费群：只推 A 级以上，B 级留在线查询 —— 推得越克制，打开率越高
-    push = [c for c in picks if c["score"] >= GRADE_A]
+    push = [c for c in picks if at_least(c, "A")]
     if not push:
         return 0
     text = render_digest(push, scanned=scanned)
@@ -1358,7 +1385,7 @@ def handle_selection_command(data, message=None):
         if member:
             _reply(data, render_digest(picks[:8], scanned=scanned))
         else:
-            free = picks_for_free() or [c for c in picks if c["score"] >= GRADE_A][:FREE_MAX_PICKS]
+            free = picks_for_free() or [c for c in picks if at_least(c, "A")][:FREE_MAX_PICKS]
             if not free:
                 _reply(data, "🐕 本期暂无符合标准的标的。\n"
                              "订阅后可查看完整榜单与实时推送 → 发送 /订阅")
