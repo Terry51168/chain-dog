@@ -102,19 +102,23 @@ def _to_float(v, default=0.0):
 # 一、配置：全部可调参数集中在此
 # ======================================================================
 # 熔断/门槛：这些是"不满足就别推"的硬条件，不是分数
-GATE_MIN_LIQ_USD = 15000      # 池子太小，进得去出不来
-GATE_MIN_AGE_MIN = 10         # 池龄 <10 分钟还在狙击期，数据全是噪音
+# 全部走环境变量：调参不该要求重新上传代码 —— 测试期一天要试三组数，
+# 每次改代码 + git push + pull + 重启，光流程就能把人耗死。
+GATE_MIN_LIQ_USD = int(os.getenv("SELECTION_MIN_LIQ", "15000"))   # 池子太小，进得去出不来
+GATE_MIN_AGE_MIN = int(os.getenv("SELECTION_MIN_AGE_MIN", "10"))  # 池龄 <10 分钟还在狙击期，数据全是噪音
 GATE_MAX_AGE_DAYS = float(os.getenv("SELECTION_MAX_AGE_DAYS", "30"))   # 老币不叫金狗，叫蓝筹
 GATE_MAX_MCAP_USD = float(os.getenv("SELECTION_MAX_MCAP", "150000000"))  # 市值过大已过成长期
 GATE_MAX_TAX_PCT = 10.0       # 买卖任一超过 10% 直接淘汰
-GATE_MIN_TXNS_24H = 50        # 24h 交易笔数太少 = 死盘
+GATE_MIN_TXNS_24H = int(os.getenv("SELECTION_MIN_TXNS", "50"))    # 24h 交易笔数太少 = 死盘
 
 # 评分权重（合计 100）
 W_SAFETY, W_CHIP, W_MOMENTUM, W_FRESH, W_NARRATIVE = 30, 25, 25, 10, 10
 
 # 分级：S 需要"全维度可验证"，数据缺失最多到 A —— 看不见筹码结构就不该给最高分
-GRADE_S, GRADE_A, GRADE_B = 85, 75, 70
-SELECTION_MIN_SCORE = GRADE_B       # 低于 70 不进榜单
+GRADE_S = int(os.getenv("SELECTION_GRADE_S", "85"))
+GRADE_A = int(os.getenv("SELECTION_GRADE_A", "75"))
+GRADE_B = int(os.getenv("SELECTION_GRADE_B", "70"))
+SELECTION_MIN_SCORE = int(os.getenv("SELECTION_MIN_SCORE", str(GRADE_B)))   # 低于此分不进榜单
 
 # 推送节流
 PUSH_INTERVAL_SEC = int(os.getenv("SELECTION_PUSH_INTERVAL", "1800"))  # 30 分钟扫一次
@@ -1659,18 +1663,37 @@ def handle_selection_command(data, message=None):
 
 
 # ---------- 战绩回溯：入选价 → 现价 ----------
-_TRACK_CACHE = {}          # addr -> (ts, price)
+_TRACK_CACHE = {}          # (addr, network) -> (ts, price)
 _TRACK_TTL = 300
 
+# Gecko 网络名 → DexScreener chainId。同一串 0x 地址在不同链上是两个毫不相干的币，
+# 不过滤链就会出现"BSC 的币拿 ETH 同地址的币报价"，涨幅动辄几亿倍。
+DS_CHAIN_OF = {v: k for k, v in DS_TO_GECKO.items()}
+ODD_ROI_PCT = 1000.0       # 涨幅超过 10 倍先当数据异常，人工核对前不进统计
 
-def _now_price(addr):
+
+def _pair_liq(p):
+    liq = p.get("liquidity")
+    return _to_float(liq.get("usd")) if isinstance(liq, dict) else _to_float(liq)
+
+
+def _now_price(item):
     """当前价。三种结果必须分开：真实价格 / 已下架(0.0) / 取价失败(None)。
 
     下架不能和网络抖动混为一谈：下架的币按 -100% 计，网络失败要跳过。
     两者都当"查不到"悄悄跳过，胜率会凭空变好看 —— 这正是战绩最不该犯的错。
+
+    两处口径必须固定，否则战绩页会出现天文数字（曾把 B 级平均拉到 +5061113%）：
+    1. 按链过滤。DexScreener 的 /tokens/{addr} 返回该地址在所有链上的交易对，
+       跨链同地址是两个不同的币，价格差几个数量级。
+    2. 按流动性取主盘，而不是取最高价。同一链上真盘旁边常挂着无人交易的假盘/测试盘，
+       取 max 等于把一个没人买的盘口当成"这个币现在的价格"。
     """
+    addr, net = item if isinstance(item, tuple) else (item, "")
+    addr, net = (addr or "").lower(), (net or "").lower()
+    key = (addr, net)
     now = time.time()
-    hit = _TRACK_CACHE.get(addr)
+    hit = _TRACK_CACHE.get(key)
     if hit and now - hit[0] < _TRACK_TTL:
         return hit[1], "ok"
     try:
@@ -1678,11 +1701,19 @@ def _now_price(addr):
                            timeout=4)
         if not r.ok:
             return None, "net"
-        pairs = (r.json().get("pairs") or [])
-        cur = max((_to_float(p.get("priceUsd")) for p in pairs), default=0.0)
+        pairs = list(r.json().get("pairs") or [])
+        want = DS_CHAIN_OF.get(net)
+        if want:
+            same = [p for p in pairs if (p.get("chainId") or "").lower() == want]
+            # 指定了链却一个交易对都没有 = 这条链上已经没得买了，按下架处理。
+            # 退回全部交易对会让"已归零"被算成涨跌，方向完全相反。
+            pairs = same
+        if not pairs:
+            return 0.0, "gone"
+        cur = _to_float(max(pairs, key=_pair_liq).get("priceUsd"))
         if cur <= 0:
             return 0.0, "gone"
-        _TRACK_CACHE[addr] = (now, cur)
+        _TRACK_CACHE[key] = (now, cur)
         if len(_TRACK_CACHE) > 2000:
             _TRACK_CACHE.clear()
         return cur, "ok"
@@ -1691,7 +1722,7 @@ def _now_price(addr):
 
 
 def _track_items(days):
-    """近 N 天记录过的标的：[(日期, 地址, 代号, 入选价, 等级), ...]
+    """近 N 天记录过的标的：[(日期, 地址, 代号, 入选价, 等级, 链), ...]
 
     同一个币只算第一次：战绩的分子分母都是"一次推荐"，重复计入同一笔会虚增样本
     数，也会让同一个币的涨跌被算好几遍。
@@ -1707,7 +1738,7 @@ def _track_items(days):
                 entry = _to_float(_upstash(f"get/xx:entry:{a}", "GET") or 0)
                 if entry > 0 and a not in seen:
                     seen.add(a)
-                    items.append((d, a, a[:6], entry, ""))
+                    items.append((d, a, a[:6], entry, "", ""))
         return items
 
     rows = sorted(load_shadow(days), key=lambda x: x.get("ts", 0))   # 旧 → 新
@@ -1719,7 +1750,7 @@ def _track_items(days):
         seen.add(a)
         t = datetime.fromtimestamp(r.get("ts", 0), tz=timezone(timedelta(hours=8)))
         items.append((t.strftime("%Y%m%d"), a, r.get("symbol") or a[:6],
-                      p, r.get("grade") or ""))
+                      p, r.get("grade") or "", r.get("network") or ""))
     return items
 
 
@@ -1736,23 +1767,34 @@ def render_track(days=7):
                 "还没有记录。\n"
                 "先发一次 /金狗 产生一条，过几小时再回来对价。")
 
-    addrs = [it[1] for it in items]
+    targets = [(it[1], it[5]) for it in items]
     try:
-        prices = list(_executor("TRACK_EXECUTOR", 6).map(_now_price, addrs))
+        prices = list(_executor("TRACK_EXECUTOR", 6).map(_now_price, targets))
     except Exception:
-        prices = [_now_price(a) for a in addrs]
+        prices = [_now_price(t) for t in targets]
 
     rows, skipped = [], 0
-    for (d, a, sym, entry, grade), (cur, st) in zip(items, prices):
+    for (d, a, sym, entry, grade, _net), (cur, st) in zip(items, prices):
         if st == "net" or cur is None:
             skipped += 1
             continue
-        rows.append({"d": d, "sym": sym, "grade": grade,
-                     "roi": (cur - entry) / entry * 100, "gone": st == "gone"})
+        gone = st == "gone"
+        roi = (cur - entry) / entry * 100
+        # 十几倍的币在链上确实存在，但几亿倍的只可能是数据错了（跨链同名盘、入选价
+        # 被截断）。这类样本必须从均值里剔掉：一条就能把 B 级平均拉到千万级，
+        # 整个战绩页当场变成笑话。
+        rows.append({"d": d, "sym": sym, "grade": grade, "roi": roi,
+                     "gone": gone, "odd": (not gone) and roi > ODD_ROI_PCT})
     if not rows:
         return "📊 战绩取价失败（行情源没响应），过几分钟再试。"
 
-    rows.sort(key=lambda r: -r["roi"])
+    normal = sorted((r for r in rows if not r["odd"]), key=lambda r: -r["roi"])
+    odd = sorted((r for r in rows if r["odd"]), key=lambda r: -r["roi"])
+    if not normal:
+        return (f"📊 甄选战绩 · 近 {days} 天（{len(odd)} 个标的）\n"
+                f"全部涨幅异常（>{ODD_ROI_PCT:.0f}%），疑似跨链同名盘或入选价记录有误，\n"
+                "已暂不计入统计。把记录发我，我核对数据源。")
+    rows = normal
     n = len(rows)
     win = sum(1 for r in rows if r["roi"] > 0)
     roi_sorted = sorted(r["roi"] for r in rows)
@@ -1782,6 +1824,12 @@ def render_track(days=7):
         lines.append(f"{'🟢' if r['roi'] > 0 else '🔴'} {icon}"
                      f"${r['sym']} {r['roi']:+.0f}%{tag}　"
                      f"{r['d'][4:6]}/{r['d'][6:]}")
+    if odd:
+        lines.append("▱▱▱▱▱▱▱▱▱▱")
+        lines.append(f"⚠️ {len(odd)} 个涨幅异常（>{ODD_ROI_PCT:.0f}%），疑跨链同名盘，未计入")
+        for r in odd[:3]:
+            lines.append(f"⚠️ ${r['sym']} ×{r['roi'] / 100:.0f} 倍　"
+                         f"{r['d'][4:6]}/{r['d'][6:]}")
     if skipped:
         lines.append(f"（另有 {skipped} 个取价失败，未计入）")
     lines.append("按入选价对现价，未计滑点与税费；下架按 -100% 计。")
