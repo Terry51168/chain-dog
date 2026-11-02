@@ -110,6 +110,10 @@ GATE_MAX_AGE_DAYS = float(os.getenv("SELECTION_MAX_AGE_DAYS", "30"))   # 老币�
 GATE_MAX_MCAP_USD = float(os.getenv("SELECTION_MAX_MCAP", "150000000"))  # 市值过大已过成长期
 GATE_MAX_TAX_PCT = 10.0       # 买卖任一超过 10% 直接淘汰
 GATE_MIN_TXNS_24H = int(os.getenv("SELECTION_MIN_TXNS", "50"))    # 24h 交易笔数太少 = 死盘
+# 换手率 = 24h 成交额 / 池子。一天换手 30 次，正常交易不可能这么密，是机器人在对倒
+# 制造"热度"然后出货。实测 40 小时 26 个币里，换手 ≥30x 的 7 个全部下跌、中位 -41%，
+# 换手 <10x 的中位只有 -3%。所以这不是"减分项"，是"直接淘汰项"。
+GATE_MAX_TURNOVER = float(os.getenv("SELECTION_MAX_TURNOVER", "30"))
 
 # 评分权重（合计 100）
 W_SAFETY, W_CHIP, W_MOMENTUM, W_FRESH, W_NARRATIVE = 30, 25, 25, 10, 10
@@ -126,9 +130,10 @@ MAX_PUSH_PER_DAY = int(os.getenv("SELECTION_MAX_PUSH_PER_DAY", "6"))
 # 影子模式：只记录、不推送。上线头一两周建议开着 —— 先攒样本再调阈值，
 # 别拿第一批付费用户当小白鼠。
 SHADOW_MODE = os.getenv("SELECTION_SHADOW", "0").strip().lower() in ("1", "true", "yes")
-# 同一个币多久内不重复评估。推送期该长（避免重复骚扰），影子期该短（要样本）。
-# 所以做成可配：测试期设 2，正式期改回 6。
-SEEN_TTL = int(os.getenv("SELECTION_SEEN_TTL_H", "6")) * 3600
+# 同一个币多久内不重复评估。实测 2 小时 TTL 时，173 条记录只对应 26 个币 ——
+# $GANG 在 38 小时里被推了 19 次，价格一路跌 24%，等于每 2 小时提醒用户"它又跌了"。
+# 一个币一天推一次已经是上限，所以默认 24 小时；影子期要样本才需要调短。
+SEEN_TTL = int(os.getenv("SELECTION_SEEN_TTL_H", "24")) * 3600
 # 影子记录落盘路径：没配 Redis 时用它，单机测试期比外部服务更可靠
 SHADOW_FILE = os.getenv("SELECTION_SHADOW_FILE", "/opt/chain-dog/shadow.jsonl")
 
@@ -376,6 +381,9 @@ def hard_gate(cand, info):
         return False, f"市值 {mcap/1e6:.0f}M，已非早期标的"
     if (cand.get("buys24", 0) + cand.get("sells24", 0)) < GATE_MIN_TXNS_24H:
         return False, "24h 交易过少"
+    turn = (cand.get("vol24") or 0) / max(liq, 1.0)
+    if turn > GATE_MAX_TURNOVER:
+        return False, f"换手 {turn:.0f}x，疑似刷量"
 
     if cand["chain_id"] is None:                     # ---------- Solana ----------
         if (info.get("mintable") or {}).get("status") == "1":
@@ -1352,14 +1360,23 @@ def render_shadow(days=3, recent=12):
     zero = sum(1 for n in auto_seq if n == 0)
     man_strong = sum(1 for r in man_picks if r.get("grade") in ("S", "A"))
     by_grade = {g: sum(1 for r in picks if r.get("grade") == g) for g in ("S", "A", "B")}
+    # 入选"次数"和"标的数"必须同时报。只报次数会让人以为抓到了 155 个机会，
+    # 实际只有 24 个币被反复推 —— 这两个数差多少，就是重复骚扰有多严重。
+    uniq = len({(r.get("addr") or "").lower()
+                for r in picks if r.get("addr") and not r.get("manual")})
+    uniq_man = len({(r.get("addr") or "").lower() for r in man_picks if r.get("addr")})
 
     # 自动和手动必须分开算："我刚推了 2 个"和"这 2 个小时的定时任务没出货"
     # 是两件事，混在一起数就永远对不上，也看不出定时任务到底有没有在干活。
     # 手动那行还要报 A 级以上几个：免费版只给 A 级以上，群里看到 2 个而这里写 8 个，
     # 差出来的 6 个全是 B 级 —— 不点明，用户只会以为记录在瞎报。
+    # 老记录里没有 addr 字段，此时不显示"（0 个标的）"，否则看起来像数据坏了
+    auto_tag = f"（{uniq} 个标的）" if uniq else ""
+    man_tag = f"（{uniq_man} 个标的）" if uniq_man else ""
     lines = [f"📊 甄选影子记录 · 近 {days} 天",
-             f"自动扫描 {len(auto_seq)} 期：入选 {sum(auto_seq)} 个，零入选 {zero} 期",
-             f"手动查询 {len(man_seq)} 次：入选 {len(man_picks)} 个"
+             f"自动扫描 {len(auto_seq)} 期：入选 {sum(auto_seq)} 次{auto_tag}，"
+             f"零入选 {zero} 期",
+             f"手动查询 {len(man_seq)} 次：入选 {len(man_picks)} 次{man_tag}"
              f"（A 级以上 {man_strong}）",
              f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"]
     if auto_seq:
@@ -1805,6 +1822,12 @@ def render_track(days=7):
              f"胜率 {win / n * 100:.0f}%　中位 {med:+.0f}%　平均 {avg:+.0f}%",
              f"最好 ${rows[0]['sym']} {rows[0]['roi']:+.0f}%　"
              f"最差 ${rows[-1]['sym']} {rows[-1]['roi']:+.0f}%"]
+    # 归零数和翻倍数必须单独列出来：榜单只显示前 10 个，而归零的全排在最后，
+    # 用户看不到"15 个里有 7 个归零"，就会以为平均 -34% 是"跌了三成"，
+    # 实际上是"一半归零、另一半涨四成"—— 这是两种完全不同的模型问题。
+    zeros = sum(1 for r in rows if r["gone"])
+    doubles = sum(1 for r in rows if r["roi"] >= 100)
+    lines.append(f"归零 {zeros} 个（{zeros / n * 100:.0f}%）　翻倍 {doubles} 个")
 
     graded = [(g, [r for r in rows if r["grade"] == g]) for g in ("S", "A", "B")]
     if any(grp for _, grp in graded):
