@@ -136,6 +136,10 @@ SHADOW_MODE = os.getenv("SELECTION_SHADOW", "0").strip().lower() in ("1", "true"
 SEEN_TTL = int(os.getenv("SELECTION_SEEN_TTL_H", "24")) * 3600
 # 影子记录落盘路径：没配 Redis 时用它，单机测试期比外部服务更可靠
 SHADOW_FILE = os.getenv("SELECTION_SHADOW_FILE", "/opt/chain-dog/shadow.jsonl")
+# 价格快照独立落盘，绝不放 shadow.jsonl —— 那里每行都当"一次入选"统计，
+# 插进去会污染所有战绩口径。单独一个文件，坏了删掉即可，不影响主流程。
+PRICE_FILE = os.getenv("SELECTION_PRICE_FILE", "/opt/chain-dog/prices.jsonl")
+PRICE_KEEP_H = int(os.getenv("SELECTION_PRICE_KEEP_H", "240"))   # 只跟踪近 10 天入选的币
 
 FREE_DELAY_SEC = 2 * 3600     # 免费群延迟 2 小时、只给 3 个 B 级以上
 FREE_MAX_PICKS = 3
@@ -1119,7 +1123,7 @@ def evaluate(cand):
 _LAST_DIAG = {}
 
 
-def scan_once(networks=None, limit=12, enrich=True, mark=True):
+def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False):
     """扫一轮，返回按分数降序的合格标的。耗时约 5~15 秒（并发）。
 
     同时把"每个候选卡在哪一层"记进 _LAST_DIAG。甄选最容易出的问题不是打分不准，
@@ -1149,13 +1153,20 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True):
     # 先排序再截断，最后才打"已看过"标记 —— 否则被截掉的那批会被误标已推，
     # 6 小时内再也进不了候选（等于白丢）。
     head = pre[:limit * 4]
-    pre = [c for c in head
-           if not _seen_before(f"{c['network']}:{c['addr'].lower()}", write=mark)]
-    if len(head) > len(pre):
-        # 去重掉的数量必须显式记下来，否则 scanned 和 rejects 永远对不上账，
-        # 看起来像"数据丢了"，其实是被去重挡掉了。小时数从常量取，
-        # 不要写死成 6 —— 调到 2 小时之后文案还写 6，排查时会跟着走错路。
-        rejects[f"已看过({SEEN_TTL // 3600}小时内)"] = len(head) - len(pre)
+    if ignore_seen:
+        # 手动查询专用：绕过去重。
+        # 定时任务每半小时把候选币全标成"已看过"，24 小时窗口内手动查询读到的是
+        # 同一份名单，于是永远返回 0 —— 用户以为没货，其实是被自己的去重锁死了。
+        # 手动查是"我现在想看看有什么"，该看到全量；mark=False 保证它不会反污染定时任务。
+        pre = head
+    else:
+        pre = [c for c in head
+               if not _seen_before(f"{c['network']}:{c['addr'].lower()}", write=mark)]
+        if len(head) > len(pre):
+            # 去重掉的数量必须显式记下来，否则 scanned 和 rejects 永远对不上账，
+            # 看起来像"数据丢了"，其实是被去重挡掉了。小时数从常量取，
+            # 不要写死成 6 —— 调到 2 小时之后文案还写 6，排查时会跟着走错路。
+            rejects[f"已看过({SEEN_TTL // 3600}小时内)"] = len(head) - len(pre)
 
     ex = _executor("QUERY_EXECUTOR", 8)
     if enrich:
@@ -1199,12 +1210,14 @@ def _cooldown_ok(uid, sec=60):
         return True
 
 
-def ensure_picks(limit=8, mark=True):
+def ensure_picks(limit=8, mark=True, ignore_seen=False):
     """取本期榜单，没有就现扫一次。
 
     返回 (picks, scanned, 是否真的扫过)。加锁 + 30 秒节流：
     群里 20 个人同时发 /金狗，不能触发 20 次全链扫描把额度打光。
     mark=False 用于手动查询：不写去重标记，免得把手动查的那批币锁死。
+    ignore_seen=True 也是手动查询用：连读取去重标记都跳过 —— 只写不写挡不住
+    "读"，定时任务标过的币照样会被读出来判成已看过。
     """
     global _LAST_SCAN_TS
     if _LAST_PICKS:
@@ -1214,7 +1227,7 @@ def ensure_picks(limit=8, mark=True):
     try:
         if _LAST_PICKS:
             return _LAST_PICKS, 0, True
-        picks, scanned = scan_once(limit=limit, mark=mark)
+        picks, scanned = scan_once(limit=limit, mark=mark, ignore_seen=ignore_seen)
         _LAST_SCAN_TS = time.time()
         return picks, scanned, True
     finally:
@@ -1476,12 +1489,107 @@ def explain(addr, network=None):
     return result
 
 
+def _bulk_price(targets):
+    """批量取价。targets = {addr: network} → {addr: price}（0.0 = 已下架）。
+
+    DexScreener 允许用逗号拼多个地址，一次拿 25 个 —— 逐个查的话，跟踪 30 个币
+    每期就是 30 次请求，90 分钟一期也够把配额磨掉。按链过滤 + 取流动性主盘的
+    口径跟 _now_price 保持一致，否则快照和战绩两套数字会对不上。
+    """
+    out, addrs = {}, list(targets)
+    for i in range(0, len(addrs), 25):
+        chunk = addrs[i:i + 25]
+        try:
+            r = _session().get(
+                "https://api.dexscreener.com/latest/dex/tokens/" + ",".join(chunk),
+                timeout=8)
+            if not r.ok:
+                continue
+            pairs = list(r.json().get("pairs") or [])
+        except Exception:
+            continue
+        book = {}
+        for p in pairs:
+            a = ((p.get("baseToken") or {}).get("address") or "").lower()
+            px = _to_float(p.get("priceUsd"))
+            if not a or px <= 0:
+                continue
+            key = (a, (p.get("chainId") or "").lower())
+            liq = _pair_liq(p)
+            if key not in book or liq > book[key][1]:
+                book[key] = (px, liq)
+        for a in chunk:
+            want = DS_CHAIN_OF.get((targets.get(a) or "").lower())
+            hit = book.get((a, want)) if want else None
+            if hit:
+                out[a] = hit[0]
+            elif any(k[0] == a for k in book):
+                out[a] = 0.0          # 只剩别的链 = 这条链上已经买不到了
+    return out
+
+
+def _snapshot_prices():
+    """给仍在跟踪的币拍一次价，写进 prices.jsonl。
+
+    shadow.jsonl 只记"入选那一刻"的价格，所以永远算不出"入选后 1 小时 / 6 小时 /
+    24 小时值多少钱"。而这正是判断该持有多久、产品该做成"推荐买入"还是"短线信号"
+    的唯一依据 —— 没有它，下一轮复盘仍然只能看"7 天后跌了多少"这种没法定价的数字。
+
+    单独一个文件：shadow.jsonl 每行都算"一次入选"，插进去会污染所有战绩口径。
+    """
+    now = time.time()
+    rows = load_shadow(days=PRICE_KEEP_H // 24 + 2)
+    targets = {}
+    for r in rows:
+        if r.get("empty"):
+            continue
+        if now - r.get("ts", 0) > PRICE_KEEP_H * 3600:
+            continue
+        a = (r.get("addr") or "").lower()
+        if a:
+            targets[a] = r.get("network") or ""
+    if not targets:
+        return 0
+    px = _bulk_price(targets)
+    if not px:
+        return 0
+    try:
+        with open(PRICE_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": int(now),
+                                "px": {a: round(p, 12) for a, p in px.items()}},
+                               ensure_ascii=False) + "\n")
+        _trim_price_file()
+    except Exception as e:
+        print(f"[pick] 价格快照写入失败: {e}")
+    return len(px)
+
+
+def _trim_price_file(keep=6000):
+    """快照文件只留最近几千行。90 分钟一条、每条几十个价，一年也就几 MB，
+    但没人盯着就会一直长 —— 顺手裁掉，省得哪天磁盘满了才发现。"""
+    try:
+        if os.path.getsize(PRICE_FILE) < 3 * 1024 * 1024:
+            return
+        with open(PRICE_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+        with open(PRICE_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines[-keep:])
+    except Exception:
+        pass
+
+
 def tick(force=False):
     """一次定时任务：扫描 → 存最近一期 → 推付费群（≤每日上限）→ 推免费群（延迟）。"""
     global _LAST_PICKS, _LAST_PICKS_TS, _FREE_LAST
     today = _now_bj().strftime("%Y%m%d")
     if _PUSH_COUNT["date"] != today:
         _PUSH_COUNT.update({"date": today, "n": 0})
+    # 快照放在推送上限判断之前：推送一天只允许 6 次，但样本密度决定能不能算出
+    # "该持有多久"，那件事比这一期推不推重要。快照自己出错也不能拖垮整轮扫描。
+    try:
+        _snapshot_prices()
+    except Exception as e:
+        print(f"[pick] 价格快照异常: {e}")
     if not force and _PUSH_COUNT["n"] >= MAX_PUSH_PER_DAY:
         return 0
 
@@ -1636,7 +1744,7 @@ def handle_selection_command(data, message=None):
         if not member and not _cooldown_ok(uid, 60):
             _reply(data, "🐕 慢一点，60 秒后才能再查一次。订阅后不限频 → /订阅")
             return True
-        picks, scanned, did_scan = ensure_picks(limit=8, mark=False)
+        picks, scanned, did_scan = ensure_picks(limit=8, mark=False, ignore_seen=True)
         if not did_scan:
             # 另一个请求正在扫，或刚扫过还没出结果：让对方等 10 秒，别触发第二次全链扫描
             _reply(data, "🐕 正在扫描全链，约 10 秒后重发 /金狗 即可")
@@ -1648,15 +1756,18 @@ def handle_selection_command(data, message=None):
         if scanned > 0:
             # 真扫了一轮才留档；scanned=0 是命中内存缓存，记了只会把同一期重复算几遍
             _shadow_record(picks, scanned, manual=True)
+        # 手动查询绕过了 24 小时去重，所以可能包含定时任务刚推过的币 ——
+        # 不说明白，用户会以为系统在拿旧货充数。
+        note = "\n（实时全量扫描，含 24 小时内已推荐过的标的）" if scanned > 0 else ""
         if member:
-            _reply(data, render_digest(picks[:8], scanned=scanned))
+            _reply(data, render_digest(picks[:8], scanned=scanned) + note)
         else:
             free = picks_for_free() or [c for c in picks if at_least(c, "A")][:FREE_MAX_PICKS]
             if not free:
                 _reply(data, "🐕 本期暂无符合标准的标的。\n"
                              "订阅后可查看完整榜单与实时推送 → 发送 /订阅")
             else:
-                _reply(data, render_digest(free, free=True, scanned=scanned))
+                _reply(data, render_digest(free, free=True, scanned=scanned) + note)
         return True
 
     if low.split(" ")[0] in ("/甄选战绩", "/战绩", "/track"):
