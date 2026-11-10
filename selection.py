@@ -122,7 +122,10 @@ W_SAFETY, W_CHIP, W_MOMENTUM, W_FRESH, W_NARRATIVE = 30, 25, 25, 10, 10
 GRADE_S = int(os.getenv("SELECTION_GRADE_S", "85"))
 GRADE_A = int(os.getenv("SELECTION_GRADE_A", "75"))
 GRADE_B = int(os.getenv("SELECTION_GRADE_B", "70"))
-SELECTION_MIN_SCORE = int(os.getenv("SELECTION_MIN_SCORE", str(GRADE_B)))   # 低于此分不进榜单
+SELECTION_MIN_SCORE = int(os.getenv("SELECTION_MIN_SCORE", "75"))   # 低于此分不进榜单
+# 等级下限：分数只是排序，等级才是承诺强度。只卡分数时，被封顶成 B 的币照样进榜
+# （实测 $牛逼 84 分 B、$BTC 80 分 B），"只推 A/S"根本没落地。这道闸才真正砍掉 B。
+MIN_GRADE = os.getenv("SELECTION_MIN_GRADE", "A").strip().upper()
 
 # 推送节流
 PUSH_INTERVAL_SEC = int(os.getenv("SELECTION_PUSH_INTERVAL", "1800"))  # 30 分钟扫一次
@@ -1182,7 +1185,17 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False
             weak.append({"symbol": c["symbol"], "score": c["score"], "grade": c["grade"]})
     evaled.sort(key=lambda c: -c["score"])
     weak.sort(key=lambda x: -x["score"])
-    hits = [c for c in evaled if c["score"] >= SELECTION_MIN_SCORE][:limit]
+    hits = []
+    for c in evaled:
+        if c["score"] < SELECTION_MIN_SCORE:
+            continue
+        if not at_least(c, MIN_GRADE):
+            # 分数够、等级不够 = 被 grade_cap 压下来的（池子/筹码/涨幅有硬伤）。
+            # 必须计入淘汰原因，否则"分数 84 却没进榜"看起来像随机丢币。
+            _drop(f"等级不足({c['grade']})")
+            continue
+        hits.append(c)
+    hits = hits[:limit]
     _LAST_DIAG = {"ts": int(time.time()), "scanned": scanned, "pre": len(pre),
                   "rejects": dict(sorted(rejects.items(), key=lambda kv: -kv[1])[:12]),
                   "weak": weak[:5], "hits": len(hits)}
