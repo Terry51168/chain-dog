@@ -143,6 +143,8 @@ SHADOW_FILE = os.getenv("SELECTION_SHADOW_FILE", "/opt/chain-dog/shadow.jsonl")
 # 插进去会污染所有战绩口径。单独一个文件，坏了删掉即可，不影响主流程。
 PRICE_FILE = os.getenv("SELECTION_PRICE_FILE", "/opt/chain-dog/prices.jsonl")
 PRICE_KEEP_H = int(os.getenv("SELECTION_PRICE_KEEP_H", "240"))   # 只跟踪近 10 天入选的币
+# 去重标记落盘：只在内存里的话，重启就清空，下一期把同一批币重推一遍
+SEEN_FILE = os.getenv("SELECTION_SEEN_FILE", "/opt/chain-dog/seen.json")
 
 FREE_DELAY_SEC = 2 * 3600     # 免费群延迟 2 小时、只给 3 个 B 级以上
 FREE_MAX_PICKS = 3
@@ -1053,7 +1055,35 @@ def quota_take(uid, limit=30):
 # ======================================================================
 # 六、扫描：取数 → 门槛 → 打分 → 排序
 # ======================================================================
-_SEEN = {}
+def _seen_load():
+    """从磁盘恢复"已看过"标记。
+
+    只放内存的话，每次重启（改代码、OOM、systemd 拉起）都会把它清空，下一期
+    立刻把同一批币重新评估、重新推一遍。实测 $GANG 在 11/11 10:47 和 16:43
+    被推了两次，间隔 6 小时——就是重启擦掉了标记。落盘之后这事不会再发生。
+    """
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        now = time.time()
+        return {k: float(v) for k, v in raw.items() if now - float(v) < SEEN_TTL}
+    except Exception:
+        return {}
+
+
+def _seen_save():
+    try:
+        with _SEEN_LOCK:
+            snap = dict(_SEEN)
+        tmp = SEEN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        os.replace(tmp, SEEN_FILE)
+    except Exception:
+        pass
+
+
+_SEEN = _seen_load()
 _SEEN_LOCK = threading.Lock()
 _LAST_PICKS = []            # 内存里保留最近一期，供免费版延迟取用
 _LAST_PICKS_TS = 0.0
@@ -1199,6 +1229,8 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False
     _LAST_DIAG = {"ts": int(time.time()), "scanned": scanned, "pre": len(pre),
                   "rejects": dict(sorted(rejects.items(), key=lambda kv: -kv[1])[:12]),
                   "weak": weak[:5], "hits": len(hits)}
+    # 标记落盘放在这里（而不是每写一条存一次）：一期只写一次盘，重启不丢
+    _seen_save()
     return hits, scanned
 
 
@@ -1577,6 +1609,39 @@ def _snapshot_prices():
     return len(px)
 
 
+def _px_at(addr, target, tol=5400):
+    """从 prices.jsonl 里取 target 时刻附近的价（容差 ±90 分钟）。
+
+    为什么战绩要看这个而不是"当前价"：实测 10 个 A/S 标的，持有 24h 中位 +5%、
+    持有 72h 中位 -22%。产品形态是"24 小时内离场"，用当前价算出来的数字
+    （-36%）描述的是一个没人会采用的做法，既不能定价也不能拿去宣传。
+    """
+    if not addr or not target:
+        return None
+    try:
+        if not os.path.exists(PRICE_FILE):
+            return None
+        best = None
+        with open(PRICE_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                px = (r.get("px") or {}).get(addr)
+                if px is None:
+                    continue
+                d = abs(r.get("ts", 0) - target)
+                if d <= tol and (best is None or d < best[0]):
+                    best = (d, _to_float(px))
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
 def _trim_price_file(keep=6000):
     """快照文件只留最近几千行。90 分钟一条、每条几十个价，一年也就几 MB，
     但没人盯着就会一直长 —— 顺手裁掉，省得哪天磁盘满了才发现。"""
@@ -1863,7 +1928,7 @@ def _now_price(item):
 
 
 def _track_items(days):
-    """近 N 天记录过的标的：[(日期, 地址, 代号, 入选价, 等级, 链), ...]
+    """近 N 天记录过的标的：[(日期, 地址, 代号, 入选价, 等级, 链, 入选时间戳), ...]
 
     同一个币只算第一次：战绩的分子分母都是"一次推荐"，重复计入同一笔会虚增样本
     数，也会让同一个币的涨跌被算好几遍。
@@ -1879,7 +1944,7 @@ def _track_items(days):
                 entry = _to_float(_upstash(f"get/xx:entry:{a}", "GET") or 0)
                 if entry > 0 and a not in seen:
                     seen.add(a)
-                    items.append((d, a, a[:6], entry, "", ""))
+                    items.append((d, a, a[:6], entry, "", "", 0))
         return items
 
     rows = sorted(load_shadow(days), key=lambda x: x.get("ts", 0))   # 旧 → 新
@@ -1891,7 +1956,8 @@ def _track_items(days):
         seen.add(a)
         t = datetime.fromtimestamp(r.get("ts", 0), tz=timezone(timedelta(hours=8)))
         items.append((t.strftime("%Y%m%d"), a, r.get("symbol") or a[:6],
-                      p, r.get("grade") or "", r.get("network") or ""))
+                      p, r.get("grade") or "", r.get("network") or "",
+                      int(r.get("ts") or 0)))
     return items
 
 
@@ -1914,8 +1980,16 @@ def render_track(days=7):
     except Exception:
         prices = [_now_price(t) for t in targets]
 
-    rows, skipped = [], 0
-    for (d, a, sym, entry, grade, _net), (cur, st) in zip(items, prices):
+    # 优先用"入选后 24 小时"的快照价。产品卖的就是"24 小时内离场"，用当前价
+    # 算出来的是"一直拿着"的收益 —— 实测这个口径下 72h 中位 -22%，而 24h 是 +5%。
+    # 两个数字说的不是同一件事，报错了会直接把一个能做的模型判成不能做。
+    rows, skipped, stale = [], 0, 0
+    for (d, a, sym, entry, grade, _net, t0), (cur, st) in zip(items, prices):
+        p24 = _px_at(a, t0 + 86400) if t0 else None
+        if p24 is not None:
+            cur, st = p24, ("gone" if p24 <= 0 else "ok")
+        else:
+            stale += 1
         if st == "net" or cur is None:
             skipped += 1
             continue
@@ -1942,10 +2016,11 @@ def render_track(days=7):
     med = roi_sorted[n // 2]
     avg = sum(roi_sorted) / n
 
-    lines = [f"📊 甄选战绩 · 近 {days} 天（{n} 个标的）",
-             f"胜率 {win / n * 100:.0f}%　中位 {med:+.0f}%　平均 {avg:+.0f}%",
-             f"最好 ${rows[0]['sym']} {rows[0]['roi']:+.0f}%　"
-             f"最差 ${rows[-1]['sym']} {rows[-1]['roi']:+.0f}%"]
+    lines = [f"📊 甄选战绩 · 近 {days} 天（{n} 个标的）"]
+    lines.append(f"口径：入选后 24 小时" + (f"（{stale} 个未满 24h，按现价）" if stale else ""))
+    lines += [f"胜率 {win / n * 100:.0f}%　中位 {med:+.0f}%　平均 {avg:+.0f}%",
+              f"最好 ${rows[0]['sym']} {rows[0]['roi']:+.0f}%　"
+              f"最差 ${rows[-1]['sym']} {rows[-1]['roi']:+.0f}%"]
     # 归零数和翻倍数必须单独列出来：榜单只显示前 10 个，而归零的全排在最后，
     # 用户看不到"15 个里有 7 个归零"，就会以为平均 -34% 是"跌了三成"，
     # 实际上是"一半归零、另一半涨四成"—— 这是两种完全不同的模型问题。
