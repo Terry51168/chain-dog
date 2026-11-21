@@ -127,6 +127,17 @@ SELECTION_MIN_SCORE = int(os.getenv("SELECTION_MIN_SCORE", "75"))   # 低于此�
 # （实测 $牛逼 84 分 B、$BTC 80 分 B），"只推 A/S"根本没落地。这道闸才真正砍掉 B。
 MIN_GRADE = os.getenv("SELECTION_MIN_GRADE", "A").strip().upper()
 
+# ===== 市场温度熔断 =====
+# 每期扫到的全部池子，24h 涨跌幅取中位数 —— 这是"整个新币板块在涨还是在跌"的客观读数。
+# 两组同样口径的数据：11/08-11/13 中位 +9.1%、胜率 50%；11/14-11/21 中位 -19.4%、胜率 25%。
+# 同一套评分、同一批门槛，差别只在市场 —— 说明模型本身不差，缺的是"什么时候该收手"。
+# 下跌市里"涨得好"的币多半是庄家拉盘出货（$BAWSAQ 82 分 -92%、$Leonida 85 分 -89%），
+# 动量分在那种环境下不是顺势指标，是反向指标。所以市场转冷必须停手，而不是硬推。
+FUSE_PCT = float(os.getenv("SELECTION_FUSE_PCT", "-15"))       # 低于此值：整期不推
+SONLY_PCT = float(os.getenv("SELECTION_SONLY_PCT", "-6"))      # 低于此值：只推 S 级
+# 样本太小时中位数不可信（一期只扫到 5 个池子，中位就是某一个币的涨跌）
+FUSE_MIN_SAMPLE = int(os.getenv("SELECTION_FUSE_MIN_SAMPLE", "30"))
+
 # 推送节流
 PUSH_INTERVAL_SEC = int(os.getenv("SELECTION_PUSH_INTERVAL", "1800"))  # 30 分钟扫一次
 MAX_PUSH_PER_DAY = int(os.getenv("SELECTION_MAX_PUSH_PER_DAY", "6"))
@@ -253,7 +264,9 @@ def _norm_pool(network, pool):
         "pc5m": _to_float(pc.get("m5")),
         "pc1h": _to_float(pc.get("h1")),
         "pc6h": _to_float(pc.get("h6")),
-        "pc24h": _to_float(pc.get("h24")),
+        # 保留 None：缺失 ≠ 0%。市场温度靠这个字段算中位数，若把"没数据"当"没涨跌"，
+        # 80 个池子里只要有 20 个缺数据，中位就会被硬拽回 0，熔断永远不触发。
+        "pc24h": _to_float(pc.get("h24"), None),
         "buys24": b24, "sells24": s24,
         "buyers24": buyers24, "sellers24": sellers24,
         "dex": ((pool.get("relationships") or {}).get("dex") or {}).get("data", {}).get("id", ""),
@@ -1156,6 +1169,32 @@ def evaluate(cand):
 _LAST_DIAG = {}
 
 
+def _market_temp(raw):
+    """这一期扫到的所有池子，24h 涨跌幅的中位数（%）。样本不足返回 None。
+
+    为什么用中位数而不是均值：新币涨幅分布极端右偏，一个 +5000% 的盘能把均值拉到
+    +40%，看起来"市场很热"，实际九成在跌。中位数才等于"随便买一个的结局"。
+    """
+    pcs = [c["pc24h"] for c in (raw or []) if isinstance(c.get("pc24h"), (int, float))]
+    if len(pcs) < FUSE_MIN_SAMPLE:
+        return None
+    pcs.sort()
+    n = len(pcs)
+    med = pcs[n // 2] if n % 2 else (pcs[n // 2 - 1] + pcs[n // 2]) / 2
+    return round(med, 1)
+
+
+def _market_state(mkt):
+    """温度 → 动作。normal 照常推，sonly 只推 S 级，fuse 整期不推。"""
+    if mkt is None:
+        return "normal"      # 样本不足时不判，宁可不动作也别误杀
+    if mkt < FUSE_PCT:
+        return "fuse"
+    if mkt < SONLY_PCT:
+        return "sonly"
+    return "normal"
+
+
 def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False):
     """扫一轮，返回按分数降序的合格标的。耗时约 5~15 秒（并发）。
 
@@ -1166,6 +1205,7 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False
     global _LAST_DIAG
     raw = _candidates(networks)
     scanned = len(raw)
+    market = _market_temp(raw)
     rejects = {}
 
     def _drop(reason):
@@ -1227,6 +1267,7 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False
         hits.append(c)
     hits = hits[:limit]
     _LAST_DIAG = {"ts": int(time.time()), "scanned": scanned, "pre": len(pre),
+                  "market": market, "mstate": _market_state(market),
                   "rejects": dict(sorted(rejects.items(), key=lambda kv: -kv[1])[:12]),
                   "weak": weak[:5], "hits": len(hits)}
     # 标记落盘放在这里（而不是每写一条存一次）：一期只写一次盘，重启不丢
@@ -1313,11 +1354,14 @@ def _send_group(gid, text):
 
 
 # ---------- 影子记录：只写库，不推送 ----------
-def _shadow_record(picks, scanned=0, manual=False):
+def _shadow_record(picks, scanned=0, manual=False, market=None, fused=False):
     """把本期结果写进 Redis（base64 过的 JSON），供事后复盘。
 
     为什么不用明文 JSON 拼路径：Upstash REST 的命令参数在 URL path 里，
     币名带 "/" 或 "?" 会把路径截断，base64 之后不会有任何特殊字符。
+
+    market/fused：熔断那期照样把"本来会推的"记下来，并打上 fused 标记。不记的话
+    永远没法回答"熔断到底救了多少次" —— 只看到推送变少，分不清是市场差还是代码坏了。
     """
     day = _now_bj().strftime("%Y%m%d")
     rows = []
@@ -1325,13 +1369,15 @@ def _shadow_record(picks, scanned=0, manual=False):
         rows.append({"ts": int(time.time()), "symbol": c["symbol"], "addr": c["addr"],
                      "network": c["network"], "score": c["score"], "grade": c["grade"],
                      "price": c.get("price"), "liq": c.get("liq"), "vol24": c.get("vol24"),
-                     "dims": c.get("dims"), "warns": (c.get("ctx") or {}).get("warns")})
+                     "dims": c.get("dims"), "warns": (c.get("ctx") or {}).get("warns"),
+                     "market": market, "fused": fused or None})
     if not rows:
         # 空结果同样要留档。连续几天 0 个，是门槛太严、还是数据源压根没给数据，
         # 只有把"为什么 0 个"记下来才分得清；只记命中数，复盘就退化成猜。
         rows.append({"ts": int(time.time()), "empty": True, "scanned": scanned,
                      "pre": _LAST_DIAG.get("pre"), "rejects": _LAST_DIAG.get("rejects"),
-                     "weak": _LAST_DIAG.get("weak")})
+                     "weak": _LAST_DIAG.get("weak"),
+                     "market": market, "fused": fused or None})
     if manual:
         # 手动 /金狗 也留档：不然"我明明推了 2 个，记录却是 0"这种对不上账的情况
         # 会一直出现。但标记来源，统计时和定时任务分开算，别把手动查询算成"期"。
@@ -1400,7 +1446,7 @@ def render_shadow(days=3, recent=12):
                 "还没有数据。\n"
                 "定时任务每 30 分钟记一次；也可以发一次 /金狗 立刻产生一条。")
 
-    picks, empties, man_picks = [], [], []
+    picks, empties, man_picks, fused_picks = [], [], [], []
     auto, man = {}, {}
     for r in rows:
         ts = r.get("ts", 0)
@@ -1408,6 +1454,9 @@ def render_shadow(days=3, recent=12):
         book.setdefault(ts, 0)
         if r.get("empty"):
             empties.append(r)
+        elif r.get("fused"):
+            # 熔断期"本可推"的币：不能算进入选，否则熔断看起来完全没生效
+            fused_picks.append(r)
         else:
             book[ts] += 1
             picks.append(r)
@@ -1437,6 +1486,14 @@ def render_shadow(days=3, recent=12):
              f"手动查询 {len(man_seq)} 次：入选 {len(man_picks)} 次{man_tag}"
              f"（A 级以上 {man_strong}）",
              f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"]
+    # 市场温度放最上面：这一期推不推、为什么推这么少，先看这一行就明白了。
+    temps = [r for r in rows if isinstance(r.get("market"), (int, float))]
+    if temps:
+        mkt = max(temps, key=lambda x: x.get("ts", 0))["market"]
+        tag = {"fuse": "熔断·停推", "sonly": "偏弱·只推S级"}.get(_market_state(mkt), "正常")
+        lines.insert(0, f"🌡 市场温度 {mkt:+.1f}%（新池24h中位）　{tag}")
+    if fused_picks:
+        lines.append(f"熔断拦下 {len(fused_picks)} 次（本可推，未计入入选）")
     if auto_seq:
         lines.append("▱▱▱▱▱▱▱▱▱▱")
         lines.append(f"每期入选数（最近 {min(recent, len(auto_seq))} 期，旧→新）")
@@ -1672,14 +1729,37 @@ def tick(force=False):
         return 0
 
     picks, scanned = scan_once()
+    market = _LAST_DIAG.get("market")
+    state = _market_state(market)
     prev_picks, prev_ts = _LAST_PICKS, _LAST_PICKS_TS
-    _LAST_PICKS, _LAST_PICKS_TS = picks, time.time()
+    # 温度每期都打日志：-15 / -6 这两个阈值目前是拍的，手里没有历史温度序列。
+    # 连记两周之后才能回测"阈值定在哪最划算"，所以这个数必须先采起来。
+    _mt = f"{market:+.1f}%" if market is not None else "N/A"
+    print(f"[pick] 市场温度 {_mt} ({state})")
 
     if SHADOW_MODE:
         # 影子期：全部记下来，一条不发。/金狗 仍可查，方便自己先看质量。
         # 必须放在 "not picks" 之前 —— 否则空扫描不留痕，而空扫描恰恰是最该看的那种。
-        _shadow_record(picks, scanned)
+        _shadow_record(picks, scanned, market=market, fused=(state == "fuse"))
+        _LAST_PICKS, _LAST_PICKS_TS = picks, time.time()
         return 0
+
+    if state == "fuse":
+        # 整期不推。市场转冷时推什么都是接刀，而客户是照着卡密买的 —— 少推一次
+        # 顶多被说"今天没货"，推错了是直接亏钱。记录照留，用来回测熔断躲掉多少亏损。
+        print(f"[pick] 市场熔断：新池24h中位 {market:+.1f}% < {FUSE_PCT:g}%，本期不推")
+        _shadow_record(picks, scanned, market=market, fused=True)
+        _LAST_PICKS, _LAST_PICKS_TS = [], time.time()
+        return 0
+
+    if state == "sonly":
+        # 弱市只留 S。数据支持这个取舍：11/14-11/21 期间 A 级 13 个中位 -19.9%，
+        # S 级 3 个中位 +5.4% —— 弱市里还能扛住的只有最高一档。
+        before = len(picks)
+        picks = [c for c in picks if c.get("grade") == "S"]
+        print(f"[pick] 市场偏弱({market:+.1f}%)：{before} 个候选只推 S 级 {len(picks)} 个")
+
+    _LAST_PICKS, _LAST_PICKS_TS = picks, time.time()
 
     if not picks:
         return 0
