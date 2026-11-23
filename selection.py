@@ -1100,6 +1100,32 @@ _SEEN = _seen_load()
 _SEEN_LOCK = threading.Lock()
 _LAST_PICKS = []            # 内存里保留最近一期，供免费版延迟取用
 _LAST_PICKS_TS = 0.0
+# 上一次真的发到群里的时间。必须落盘：如果在内存里，重启就归零，熔断会误以为
+# "已经 72 小时没推"而立刻放探针，等于熔断被重启绕过。
+LAST_PUSH_FILE = os.getenv("SELECTION_LASTPUSH_FILE", "/opt/chain-dog/lastpush.json")
+FUSE_PROBE_H = 72
+
+
+def _push_ts_load():
+    try:
+        with open(LAST_PUSH_FILE, encoding="utf-8") as f:
+            return float(json.load(f).get("ts") or 0)
+    except Exception:
+        return 0.0
+
+
+def _push_ts_save(ts):
+    try:
+        d = os.path.dirname(LAST_PUSH_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(LAST_PUSH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ts": ts}, f)
+    except Exception:
+        pass
+
+
+_LAST_PUSH_TS = _push_ts_load() or time.time()
 _PUSH_COUNT = {"date": "", "n": 0}
 _FREE_LAST = 0.0
 
@@ -1143,6 +1169,7 @@ def _candidates(networks=None):
             if key in seen:
                 continue
             seen.add(key)
+            c["kind"] = _kind      # new_pools / trending_pools：温度要分开算
             out.append(c)
     return out
 
@@ -1169,13 +1196,19 @@ def evaluate(cand):
 _LAST_DIAG = {}
 
 
-def _market_temp(raw):
-    """这一期扫到的所有池子，24h 涨跌幅的中位数（%）。样本不足返回 None。
+def _market_temp(raw, kind=None):
+    """这一期扫到的池子，24h 涨跌幅的中位数（%）。样本不足返回 None。
 
     为什么用中位数而不是均值：新币涨幅分布极端右偏，一个 +5000% 的盘能把均值拉到
     +40%，看起来"市场很热"，实际九成在跌。中位数才等于"随便买一个的结局"。
+
+    为什么要分 kind：new_pools 是刚创建的池子，它的"24h 涨跌"实际只覆盖开盘后几小时，
+    大概率围着 0 打转，拿来当市场温度会永远不触发（实测 80 个池子中位 +0.1%）。
+    trending_pools 是已经跑起来的热门盘，才反映真实买卖力量。
     """
-    pcs = [c["pc24h"] for c in (raw or []) if isinstance(c.get("pc24h"), (int, float))]
+    pcs = [c["pc24h"] for c in (raw or [])
+           if isinstance(c.get("pc24h"), (int, float))
+           and (kind is None or c.get("kind") == kind)]
     if len(pcs) < FUSE_MIN_SAMPLE:
         return None
     pcs.sort()
@@ -1184,13 +1217,48 @@ def _market_temp(raw):
     return round(med, 1)
 
 
-def _market_state(mkt):
-    """温度 → 动作。normal 照常推，sonly 只推 S 级，fuse 整期不推。"""
-    if mkt is None:
-        return "normal"      # 样本不足时不判，宁可不动作也别误杀
-    if mkt < FUSE_PCT:
+def _strategy_health(n=6, days=7):
+    """最近 n 个"已经推满 24 小时"的币，24h 收益的中位数（%）。样本不足返回 None。
+
+    这是唯一有直接因果的熔断依据：市场温度是猜"接下来会不会差"，这个是看"我们最近
+    到底赚没赚"。11/14-11/21 那批 24h 中位 -19.4%，如果当时有这个开关，11/16 之后
+    就该停手，而不是一路推到 $Leonida -89%、$BAWSAQ -92% 才反应过来。
+    """
+    # 注意这里不排除 fused：熔断期"本可推"的币正好是免费的探针 —— 停推之后
+    # 只有它们能回答"策略到底恢复没有"。排除掉就等于把温度计拔了再问几度。
+    rows = [r for r in load_shadow(days)
+            if r.get("symbol") and not r.get("manual")]
+    rows.sort(key=lambda x: x.get("ts", 0), reverse=True)   # 新 → 旧
+    out, seen, now = [], set(), time.time()
+    for r in rows:
+        if len(out) >= n:
+            break
+        a = (r.get("addr") or "").lower()
+        e = _to_float(r.get("price") or 0)
+        ts = r.get("ts") or 0
+        if not a or e <= 0 or a in seen or ts + 86400 > now:
+            continue          # 同币只算一次；没满 24 小时的不算（还没到卖出点）
+        p24 = _px_at(a, ts + 86400)
+        if p24 is None:
+            continue
+        seen.add(a)
+        out.append((p24 / e - 1) * 100)
+    if len(out) < n:
+        return None
+    out.sort()
+    m = len(out)
+    return round(out[m // 2] if m % 2 else (out[m // 2 - 1] + out[m // 2]) / 2, 1)
+
+
+def _market_state(mkt, health=None):
+    """温度/策略健康度 → 动作。normal 照常推，sonly 只推 S 级，fuse 整期不推。
+
+    两个信号取"任一触发"：市场温度看外盘，策略健康度看自己最近的手气。
+    外盘数据是猜的，自己的盈亏是实的，所以宁可有一个先亮红灯就先收手。
+    """
+    if (health is not None and health < FUSE_PCT) or (mkt is not None and mkt < FUSE_PCT):
         return "fuse"
-    if mkt < SONLY_PCT:
+    if (health is not None and health < SONLY_PCT) or (mkt is not None and mkt < SONLY_PCT):
         return "sonly"
     return "normal"
 
@@ -1206,6 +1274,8 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False
     raw = _candidates(networks)
     scanned = len(raw)
     market = _market_temp(raw)
+    mkt_trend = _market_temp(raw, "trending_pools")   # 热门老盘：真实买卖力量
+    mkt_new = _market_temp(raw, "new_pools")          # 新盘：多半围着 0 打转，仅留档
     rejects = {}
 
     def _drop(reason):
@@ -1267,7 +1337,7 @@ def scan_once(networks=None, limit=12, enrich=True, mark=True, ignore_seen=False
         hits.append(c)
     hits = hits[:limit]
     _LAST_DIAG = {"ts": int(time.time()), "scanned": scanned, "pre": len(pre),
-                  "market": market, "mstate": _market_state(market),
+                  "market": market, "mkt_trend": mkt_trend, "mkt_new": mkt_new,
                   "rejects": dict(sorted(rejects.items(), key=lambda kv: -kv[1])[:12]),
                   "weak": weak[:5], "hits": len(hits)}
     # 标记落盘放在这里（而不是每写一条存一次）：一期只写一次盘，重启不丢
@@ -1354,7 +1424,7 @@ def _send_group(gid, text):
 
 
 # ---------- 影子记录：只写库，不推送 ----------
-def _shadow_record(picks, scanned=0, manual=False, market=None, fused=False):
+def _shadow_record(picks, scanned=0, manual=False, market=None, fused=False, health=None):
     """把本期结果写进 Redis（base64 过的 JSON），供事后复盘。
 
     为什么不用明文 JSON 拼路径：Upstash REST 的命令参数在 URL path 里，
@@ -1370,14 +1440,14 @@ def _shadow_record(picks, scanned=0, manual=False, market=None, fused=False):
                      "network": c["network"], "score": c["score"], "grade": c["grade"],
                      "price": c.get("price"), "liq": c.get("liq"), "vol24": c.get("vol24"),
                      "dims": c.get("dims"), "warns": (c.get("ctx") or {}).get("warns"),
-                     "market": market, "fused": fused or None})
+                     "market": market, "fused": fused or None, "health": health})
     if not rows:
         # 空结果同样要留档。连续几天 0 个，是门槛太严、还是数据源压根没给数据，
         # 只有把"为什么 0 个"记下来才分得清；只记命中数，复盘就退化成猜。
         rows.append({"ts": int(time.time()), "empty": True, "scanned": scanned,
                      "pre": _LAST_DIAG.get("pre"), "rejects": _LAST_DIAG.get("rejects"),
                      "weak": _LAST_DIAG.get("weak"),
-                     "market": market, "fused": fused or None})
+                     "market": market, "fused": fused or None, "health": health})
     if manual:
         # 手动 /金狗 也留档：不然"我明明推了 2 个，记录却是 0"这种对不上账的情况
         # 会一直出现。但标记来源，统计时和定时任务分开算，别把手动查询算成"期"。
@@ -1488,10 +1558,15 @@ def render_shadow(days=3, recent=12):
              f"S {by_grade['S']} / A {by_grade['A']} / B {by_grade['B']}"]
     # 市场温度放最上面：这一期推不推、为什么推这么少，先看这一行就明白了。
     temps = [r for r in rows if isinstance(r.get("market"), (int, float))]
-    if temps:
-        mkt = max(temps, key=lambda x: x.get("ts", 0))["market"]
-        tag = {"fuse": "熔断·停推", "sonly": "偏弱·只推S级"}.get(_market_state(mkt), "正常")
-        lines.insert(0, f"🌡 市场温度 {mkt:+.1f}%（新池24h中位）　{tag}")
+    hlth = [r for r in rows if isinstance(r.get("health"), (int, float))]
+    mkt = max(temps, key=lambda x: x.get("ts", 0))["market"] if temps else None
+    hv = max(hlth, key=lambda x: x.get("ts", 0))["health"] if hlth else None
+    if temps or hlth:
+        _t = f"{mkt:+.1f}%" if mkt is not None else "N/A"
+        _h = f"{hv:+.1f}%" if hv is not None else "样本不足"
+        tag = {"fuse": "熔断·停推", "sonly": "偏弱·只推S级"}.get(
+            _market_state(mkt, hv), "正常")
+        lines.insert(0, f"🌡 温度 {_t}｜近6期 {_h}　{tag}")
     if fused_picks:
         lines.append(f"熔断拦下 {len(fused_picks)} 次（本可推，未计入入选）")
     if auto_seq:
@@ -1715,7 +1790,7 @@ def _trim_price_file(keep=6000):
 
 def tick(force=False):
     """一次定时任务：扫描 → 存最近一期 → 推付费群（≤每日上限）→ 推免费群（延迟）。"""
-    global _LAST_PICKS, _LAST_PICKS_TS, _FREE_LAST
+    global _LAST_PICKS, _LAST_PICKS_TS, _FREE_LAST, _LAST_PUSH_TS
     today = _now_bj().strftime("%Y%m%d")
     if _PUSH_COUNT["date"] != today:
         _PUSH_COUNT.update({"date": today, "n": 0})
@@ -1730,27 +1805,36 @@ def tick(force=False):
 
     picks, scanned = scan_once()
     market = _LAST_DIAG.get("market")
-    state = _market_state(market)
+    health = _strategy_health()
+    state = _market_state(market, health)
     prev_picks, prev_ts = _LAST_PICKS, _LAST_PICKS_TS
-    # 温度每期都打日志：-15 / -6 这两个阈值目前是拍的，手里没有历史温度序列。
-    # 连记两周之后才能回测"阈值定在哪最划算"，所以这个数必须先采起来。
+    # 三个数每期都打：温度是猜的、健康度是实的，攒两周才能回测阈值定在哪最划算。
     _mt = f"{market:+.1f}%" if market is not None else "N/A"
-    print(f"[pick] 市场温度 {_mt} ({state})")
+    _hc = f"{health:+.1f}%" if health is not None else "样本不足"
+    print(f"[pick] 市场温度 {_mt}｜策略近6期 {_hc}｜{state}")
 
     if SHADOW_MODE:
         # 影子期：全部记下来，一条不发。/金狗 仍可查，方便自己先看质量。
         # 必须放在 "not picks" 之前 —— 否则空扫描不留痕，而空扫描恰恰是最该看的那种。
-        _shadow_record(picks, scanned, market=market, fused=(state == "fuse"))
+        _shadow_record(picks, scanned, market=market, fused=(state == "fuse"), health=health)
         _LAST_PICKS, _LAST_PICKS_TS = picks, time.time()
         return 0
 
     if state == "fuse":
-        # 整期不推。市场转冷时推什么都是接刀，而客户是照着卡密买的 —— 少推一次
-        # 顶多被说"今天没货"，推错了是直接亏钱。记录照留，用来回测熔断躲掉多少亏损。
-        print(f"[pick] 市场熔断：新池24h中位 {market:+.1f}% < {FUSE_PCT:g}%，本期不推")
-        _shadow_record(picks, scanned, market=market, fused=True)
-        _LAST_PICKS, _LAST_PICKS_TS = [], time.time()
-        return 0
+        # 整期不推。自己最近的手气已经连续为负时，推什么都是接刀 —— 少推一次顶多
+        # 被说"今天没货"，推错了是照着卡密买的客户直接亏钱。记录照留，
+        # 用来回测熔断到底躲掉了多少亏损。
+        silent = time.time() - _LAST_PUSH_TS < FUSE_PROBE_H * 3600
+        probe = [] if silent else [c for c in picks if c.get("grade") == "S"][:1]
+        if not probe:
+            print(f"[pick] 熔断：温度 {_mt} / 策略 {_hc} 触发（阈值 {FUSE_PCT:g}%），本期不推")
+            _shadow_record(picks, scanned, market=market, fused=True, health=health)
+            _LAST_PICKS, _LAST_PICKS_TS = [], time.time()
+            return 0
+        # 72 小时一条都没推过：再不开仓就永远收不到新样本，熔断会把自己锁死。
+        # 放一个 S 级探针出去，用真实成交检验"是不是真的还没恢复"。
+        print(f"[pick] 熔断已超 {FUSE_PROBE_H} 小时，放 1 个 S 级探针：${probe[0]['symbol']}")
+        picks = probe
 
     if state == "sonly":
         # 弱市只留 S。数据支持这个取舍：11/14-11/21 期间 A 级 13 个中位 -19.9%，
@@ -1781,6 +1865,8 @@ def tick(force=False):
         _send_group(gid, text)
     if PAID_GROUPS:
         _PUSH_COUNT["n"] += 1
+        _LAST_PUSH_TS = time.time()
+        _push_ts_save(_LAST_PUSH_TS)
     # 战绩：记下当期入选价，供 /甄选战绩 回溯
     for c in push:
         _upstash(f"set/xx:entry:{c['addr'].lower()}/{c.get('price', 0)}")
