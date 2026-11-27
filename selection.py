@@ -1217,12 +1217,16 @@ def _market_temp(raw, kind=None):
     return round(med, 1)
 
 
-def _strategy_health(n=6, days=7):
+def _strategy_health(n=12, days=21):
     """最近 n 个"已经推满 24 小时"的币，24h 收益的中位数（%）。样本不足返回 None。
 
     这是唯一有直接因果的熔断依据：市场温度是猜"接下来会不会差"，这个是看"我们最近
     到底赚没赚"。11/14-11/21 那批 24h 中位 -19.4%，如果当时有这个开关，11/16 之后
     就该停手，而不是一路推到 $Leonida -89%、$BAWSAQ -92% 才反应过来。
+
+    为什么 n 从 6 提到 12、窗口从 7 天提到 21 天：n=6 时只取最近 6 个，跌得最惨的
+    那几天一滚出窗口，中位立刻从 -51% 反弹到 -11.8%，熔断自己就解开了 —— 等于
+    "忘了疼就继续冲"。12 个样本要连续好转才抬得动中位，21 天窗口保证取满 12 个。
     """
     # 注意这里不排除 fused：熔断期"本可推"的币正好是免费的探针 —— 停推之后
     # 只有它们能回答"策略到底恢复没有"。排除掉就等于把温度计拔了再问几度。
@@ -1565,8 +1569,8 @@ def render_shadow(days=3, recent=12):
         _t = f"{mkt:+.1f}%" if mkt is not None else "N/A"
         _h = f"{hv:+.1f}%" if hv is not None else "样本不足"
         tag = {"fuse": "熔断·停推", "sonly": "偏弱·只推S级"}.get(
-            _market_state(mkt, hv), "正常")
-        lines.insert(0, f"🌡 温度 {_t}｜近6期 {_h}　{tag}")
+            _market_state(None, hv), "正常")
+        lines.insert(0, f"🌡 温度 {_t}（仅记录）｜策略近12期 {_h}　{tag}")
     if fused_picks:
         lines.append(f"熔断拦下 {len(fused_picks)} 次（本可推，未计入入选）")
     if auto_seq:
@@ -1804,14 +1808,15 @@ def tick(force=False):
         return 0
 
     picks, scanned = scan_once()
+    # 温度只留档不参与判断：它取的是 new_pools，实测长期贴着 0（0.1 / 0.9 / -0.3），
+    # 拿来当熔断线等于没装。真正有信息量的是 health —— 我们自己最近到底赚没赚。
     market = _LAST_DIAG.get("market")
     health = _strategy_health()
-    state = _market_state(market, health)
+    state = _market_state(None, health)
     prev_picks, prev_ts = _LAST_PICKS, _LAST_PICKS_TS
-    # 三个数每期都打：温度是猜的、健康度是实的，攒两周才能回测阈值定在哪最划算。
     _mt = f"{market:+.1f}%" if market is not None else "N/A"
     _hc = f"{health:+.1f}%" if health is not None else "样本不足"
-    print(f"[pick] 市场温度 {_mt}｜策略近6期 {_hc}｜{state}")
+    print(f"[pick] 温度 {_mt}(仅记录)｜策略近12期 {_hc}｜{state}")
 
     if SHADOW_MODE:
         # 影子期：全部记下来，一条不发。/金狗 仍可查，方便自己先看质量。
@@ -1827,7 +1832,7 @@ def tick(force=False):
         silent = time.time() - _LAST_PUSH_TS < FUSE_PROBE_H * 3600
         probe = [] if silent else [c for c in picks if c.get("grade") == "S"][:1]
         if not probe:
-            print(f"[pick] 熔断：温度 {_mt} / 策略 {_hc} 触发（阈值 {FUSE_PCT:g}%），本期不推")
+            print(f"[pick] 熔断：策略近12期 {_hc} < {FUSE_PCT:g}%，本期不推")
             _shadow_record(picks, scanned, market=market, fused=True, health=health)
             _LAST_PICKS, _LAST_PICKS_TS = [], time.time()
             return 0
@@ -2373,6 +2378,27 @@ def _demo_fixtures():
         out.append(c)
     out.sort(key=lambda x: -x["score"])
     return [c for c in out if c["score"] >= SELECTION_MIN_SCORE]
+
+
+def _boot_scheduler():
+    """进程起来就拉起扫描线程，不必等群里有人说话。
+
+    原来只靠 app.before_request 启动：重启后如果没人发消息，扫描线程永远不启动。
+    表现是"服务 active、数据不涨"，半夜 OOM 自动重启更是整夜空转，第二天才发现
+    断了 8 小时。延迟 8 秒是为了让 Flask 先把端口挂上，避免启动期抢线程池。
+    """
+    time.sleep(8)
+    try:
+        ensure_scheduler()
+        print("[pick] 启动钩子：扫描线程已就绪（无需等群消息）")
+    except Exception as e:
+        print(f"[pick] 启动钩子失败: {e}")
+
+
+# 只在被 import（正常运行时）启动；`python selection.py` 自检时不启动，
+# 否则会带着 fixture 数据去扫真实池子。
+if __name__ != "__main__" and os.getenv("SELECTION_NO_AUTOSTART") != "1":
+    threading.Thread(target=_boot_scheduler, daemon=True, name="xx-boot").start()
 
 
 if __name__ == "__main__":
